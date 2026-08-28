@@ -370,15 +370,16 @@ static_assert(sizeof(Mat4f) == sizeof(float) * 16, "Mat4 has unexpected padding"
 // ========================================================================= */
 
 template <size_t N, size_t M, typename T> struct Mat {
-    Vec<M, T> rows[N];
+    Vec<M, T> rows[N] = {0};
 
     T* data() { return &rows[0][0]; }
     const T* data() const { return &rows[0][0]; }
 
     static Mat identity() requires ( N == M ) {
         Mat res;
+        int oneIdx = 0;
         for (int row = 0; row < N; ++row)
-            res[row][row + 1] = 1;
+            res[row][row] = 1;
         return res;
     }
 
@@ -394,20 +395,63 @@ template <size_t N, size_t M, typename T> struct Mat {
     }
 
     T determinant() const requires ( N == M ) {
-        T det;
+        Mat copy = *this;
+        T det = T(1);
         int sign = 1;
 
-        for (int row = 0; row < N; ++row) {
-            for (int col = 0; col < N; ++col) {
-                
+        for (size_t col = 0; col < N; ++col) {
+            size_t pivotRow = col;
+            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
+
+            if (pivotRow == N) return T(0);
+
+            if (pivotRow != col) {
+                std::swap(copy.rows[pivotRow], copy.rows[col]);
+                sign = -sign;
+            }
+
+            for (size_t row = col + 1; row < N; ++row) {
+                T factor = copy[row][col] / copy[col][col];
+                for (size_t k = col; k < N; ++k)
+                    copy[row][k] -= factor * copy[col][k];
             }
         }
 
-        return 0;
+        for (size_t i = 0; i < N; ++i) det *= copy[i][i];
+        return sign * det;
     }
 
     Mat inverse() const requires ( N == M ) {
-        return *this;
+        Mat copy = *this;
+        Mat result;
+        for (size_t i = 0; i < N; ++i) result[i][i] = T(1);
+
+        for (size_t col = 0; col < N; ++col) {
+            size_t pivotRow = col;
+            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
+
+            if (pivotRow != col) {
+                std::swap(copy.rows[pivotRow], copy.rows[col]);
+                std::swap(result.rows[pivotRow], result.rows[col]);
+            }
+
+            T pivot = copy[col][col];
+            for (size_t k = 0; k < N; ++k) {
+                copy[col][k]   /= pivot;
+                result[col][k] /= pivot;
+            }
+
+            for (size_t row = 0; row < N; ++row) {
+                if (row == col) continue;
+                T factor = copy[row][col];
+                for (size_t k = 0; k < N; ++k) {
+                    copy[row][k]   -= factor * copy[col][k];
+                    result[row][k] -= factor * result[col][k];
+                }
+            }
+        }
+
+        return result;
     }
 
     Vec<M, T>& operator[](int i) { return rows[i]; }

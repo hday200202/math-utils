@@ -845,6 +845,8 @@ void testMat4() {
 
 #if TEST_MATNXM
 void testMatNxM() {
+    math::Mat<5, 5, float> I = math::Mat<5, 5, float>::identity();
+    std::cout << I << std::endl;
     // Square (N == M) case — mirrors the Mat2/Mat3/Mat4 pattern exactly,
     // same numbers as the Mat3 test, so the expected values below are the
     // same hand-verified ones.
