@@ -236,6 +236,9 @@ template <size_t N, typename T> struct Vec {
     const T& operator[](int i) const { return v[i]; }
 };
 
+static_assert(std::is_standard_layout_v<Vec<5, float>>, "Vec<5, float> must be standard-layout");
+static_assert(sizeof(Vec<5, float>) == sizeof(float) * 5, "Vec4 has unexpected padding");
+
 
 
 /* ========================================================================= //
