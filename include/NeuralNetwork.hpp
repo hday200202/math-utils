@@ -5,21 +5,62 @@
 #include "Vector.hpp"
 #include "Matrix.hpp"
 
+#define e_const 2.718281828459
+
 namespace math {
 
 /* ========================================================================= //
     Activations
 // ========================================================================= */
 
-template <size_t N, typename T> Vec<N, T> sigmoid(const Vec<N, T>& x);
-template <size_t N, typename T> Vec<N, T> tanh(const Vec<N, T>& x);
+template <size_t N, typename T> Vec<N, T> sigmoid(const Vec<N, T>& x) {
+    return apply(x, [](T x){
+        if (x >= 0) return T(1) / (T(1) + std::exp(-x));
+        else return std::exp(x[i]) / (T(1) + std::exp(x));
+    });
+}
+
+
+template <typename T> T tanh(const T x) {
+    T t = std::exp(T(-2)*std::abs(x));
+    return std::signbit(x) * (T(1) - t);
+}
+
+
+template <size_t N, typename T> Vec<N, T> tanh(const Vec<N, T>& x) {
+    Vec<N, T> out;
+
+    for (size_t i = 0; i < N; ++i)
+        out[i] = tanh(x[i]);
+
+    return out;
+}
+
+
 template <size_t N, typename T> Vec<N, T> relu(const Vec<N, T>& x);
 template <size_t N, typename T> Vec<N, T> leakyRelu(const Vec<N, T>& x, T alpha = T(0.01));
 template <size_t N, typename T> Vec<N, T> softmax(const Vec<N, T>& x);
 
-template <size_t N, typename T> Vec<N, T> sigmoidDerivative(const Vec<N, T>& x);
-template <size_t N, typename T> Vec<N, T> tanhDerivative(const Vec<N, T>& x);
-template <size_t N, typename T> Vec<N, T> reluDerivative(const Vec<N, T>& x);
+template <size_t N, typename T> Vec<N, T> sigmoidPrime(const Vec<N, T>& x);
+
+
+template <typename T> T tanhPrime(const T x) {
+    T tanhx = tanh(x);
+    return T(1) - (tanhx * tanhx);
+}
+
+
+template <size_t N, typename T> Vec<N, T> tanhPrime(const Vec<N, T>& x) {
+    Vec<N, T> out;
+
+    for (size_t i = 0; i < N; ++i)
+        out[i] = tanhPrime(x[i]);
+
+    return out;
+}
+
+
+template <size_t N, typename T> Vec<N, T> reluPrime(const Vec<N, T>& x);
 
 
 
@@ -27,7 +68,14 @@ template <size_t N, typename T> Vec<N, T> reluDerivative(const Vec<N, T>& x);
     Shared infrastructure
 // ========================================================================= */
 
-template <size_t N, typename T, typename F> Vec<N, T> apply(const Vec<N, T>& v, F func);
+template <size_t N, typename T, typename F> Vec<N, T> apply(const Vec<N, T>& v, F func) {
+    Vec<N, T> out;
+
+    for (int i = 0; i < N; ++i)
+        out[i] = func(x[i]);
+
+    return out;
+}
 
 
 
@@ -46,10 +94,10 @@ template <size_t N, size_t M, typename T> Mat<N, M, T> outerProduct(const Vec<N,
 // ========================================================================= */
 
 template <size_t N, typename T> T meanSquaredError(const Vec<N, T>& predicted, const Vec<N, T>& actual);
-template <size_t N, typename T> Vec<N, T> meanSquaredErrorDerivative(const Vec<N, T>& predicted, const Vec<N, T>& actual);
+template <size_t N, typename T> Vec<N, T> meanSquaredErrorPrime(const Vec<N, T>& predicted, const Vec<N, T>& actual);
 
 template <size_t N, typename T> T crossEntropy(const Vec<N, T>& predicted, const Vec<N, T>& actual);
-template <size_t N, typename T> Vec<N, T> crossEntropyDerivative(const Vec<N, T>& predicted, const Vec<N, T>& actual);
+template <size_t N, typename T> Vec<N, T> crossEntropyPrime(const Vec<N, T>& predicted, const Vec<N, T>& actual);
 
 
 
