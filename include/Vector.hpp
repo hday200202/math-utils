@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <array>
 #include <numeric>
+#include <functional>
 
 namespace math {
 
@@ -234,6 +235,11 @@ template <size_t N, typename T> struct Vec {
 
     T& operator[](int i) { return v[i]; }
     const T& operator[](int i) const { return v[i]; }
+
+    void apply(std::function<T(T)> func) {
+        for (int i = 0; i < N; ++i)
+            v[i] = func(v[i]);
+    }
 };
 
 static_assert(std::is_standard_layout_v<Vec<5, float>>, "Vec<5, float> must be standard-layout");
@@ -429,6 +435,27 @@ template <typename T> inline Vec4<T> faceforward(const Vec4<T>& n, const Vec4<T>
 
 template <size_t N, typename T> inline Vec<N, T> faceforward(const Vec<N, T>& n, const Vec<N, T>& i, const Vec<N, T>& nref)
 { return (nref.dot(i) < 0) ? n : -n; }
+
+
+/* apply (to all elements) ================================================= */
+template <size_t N, typename T, typename F> 
+inline Vec<N, T> apply(const Vec<N, T>& v, F func) requires std::is_invocable_r_v<T, F, T> {
+    Vec<N, T> out;
+
+    for (int i = 0; i < N; ++i)
+        out[i] = func(v[i]);
+
+    return out;
+}
+
+template <size_t N, typename T> inline T sum(const Vec<N, T>& v) {
+    T sum = T(0);
+
+    for (size_t i = 0; i < N; ++i)
+        sum += v[i];
+
+    return sum;
+}
 
 
 

@@ -34,3 +34,21 @@ rdbi-demo-asm:
 	mkdir -p bin/rdbi
 	echo "building demo release with debug info..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -S -o bin/rdbi/demo src/demo.cpp
+
+debug-nn:
+	clear
+	mkdir -p bin/debug
+	echo "building neural network demo..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/nn-demo src/nn-demo.cpp -Werror
+
+release-nn:
+	clear
+	mkdir -p bin/release
+	echo "building neural network release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/nn-demo src/nn-demo.cpp -Werror
+
+rdbi-nn:
+	clear
+	mkdir -p bin/rdbi
+	echo "building neural network rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/nn-demo src/nn-demo.cpp -Werror
