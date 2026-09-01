@@ -1,5 +1,12 @@
 #pragma once
 
+#include <cstdint>
+#include <cmath>
+#include <cassert>
+#include <algorithm>
+#include <initializer_list>
+#include <vector>
+
 #include "Vector.hpp"
 
 namespace math {
@@ -539,3 +546,204 @@ template <typename T> inline Mat4<T> operator*(const T s, const Mat4<T>& m)
 { return { s*m.rows[0], s*m.rows[1], s*m.rows[2], s*m.rows[3] }; }
 
 }
+
+/* ========================================================================= //
+    Dynamically allocated counterparts (math::dyn)
+// ========================================================================= */
+
+namespace math::dyn {
+
+/* ========================================================================= //
+    MatNxM (dynamically allocated)
+// ========================================================================= */
+
+template <typename T> struct Mat {
+    std::vector<Vec<T>> rows;
+
+    Mat() = default;
+    Mat(size_t n, size_t m) : rows(n, Vec<T>(m)) {}
+    Mat(std::initializer_list<Vec<T>> list) : rows(list) {}
+
+    size_t numRows() const { return rows.size(); }
+    size_t numCols() const { return rows.empty() ? 0 : rows[0].size(); }
+
+    bool isSquare() const { return numRows() == numCols(); }
+
+    void resize(size_t n, size_t m) { rows.assign(n, Vec<T>(m)); }
+
+    T* data() { return rows[0].data(); }
+    const T* data() const { return rows[0].data(); }
+
+    static Mat identity(size_t n) {
+        Mat res(n, n);
+        for (size_t row = 0; row < n; ++row)
+            res[row][row] = T(1);
+        return res;
+    }
+
+    Mat transpose() const {
+        const size_t N = numRows();
+        const size_t M = numCols();
+        Mat res(M, N);
+
+        for (size_t row = 0; row < N; ++row) {
+            for (size_t col = 0; col < M; ++col)
+                res[col][row] = rows[row][col];
+        }
+
+        return res;
+    }
+
+    T determinant() const {
+        assert(isSquare() && "determinant: matrix must be square");
+        const size_t N = numRows();
+
+        Mat copy = *this;
+        T det = T(1);
+        int sign = 1;
+
+        for (size_t col = 0; col < N; ++col) {
+            size_t pivotRow = col;
+            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
+
+            if (pivotRow == N) return T(0);
+
+            if (pivotRow != col) {
+                std::swap(copy.rows[pivotRow], copy.rows[col]);
+                sign = -sign;
+            }
+
+            for (size_t row = col + 1; row < N; ++row) {
+                T factor = copy[row][col] / copy[col][col];
+                for (size_t k = col; k < N; ++k)
+                    copy[row][k] -= factor * copy[col][k];
+            }
+        }
+
+        for (size_t i = 0; i < N; ++i) det *= copy[i][i];
+        return sign * det;
+    }
+
+    Mat inverse() const {
+        assert(isSquare() && "inverse: matrix must be square");
+        const size_t N = numRows();
+
+        Mat copy = *this;
+        Mat result(N, N);
+        for (size_t i = 0; i < N; ++i) result[i][i] = T(1);
+
+        for (size_t col = 0; col < N; ++col) {
+            size_t pivotRow = col;
+            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
+
+            if (pivotRow != col) {
+                std::swap(copy.rows[pivotRow], copy.rows[col]);
+                std::swap(result.rows[pivotRow], result.rows[col]);
+            }
+
+            T pivot = copy[col][col];
+            for (size_t k = 0; k < N; ++k) {
+                copy[col][k]   /= pivot;
+                result[col][k] /= pivot;
+            }
+
+            for (size_t row = 0; row < N; ++row) {
+                if (row == col) continue;
+                T factor = copy[row][col];
+                for (size_t k = 0; k < N; ++k) {
+                    copy[row][k]   -= factor * copy[col][k];
+                    result[row][k] -= factor * result[col][k];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    Vec<T>& operator[](size_t i) { return rows[i]; }
+    const Vec<T>& operator[](size_t i) const { return rows[i]; }
+
+    Mat operator+(const Mat& m) const {
+        assert(numRows() == m.numRows() && numCols() == m.numCols() && "operator+: shape mismatch");
+        Mat res(numRows(), numCols());
+        for (size_t row = 0; row < numRows(); ++row)
+            res[row] = rows[row] + m[row];
+        return res;
+    }
+
+    Mat operator-(const Mat& m) const {
+        assert(numRows() == m.numRows() && numCols() == m.numCols() && "operator-: shape mismatch");
+        Mat res(numRows(), numCols());
+        for (size_t row = 0; row < numRows(); ++row)
+            res[row] = rows[row] - m[row];
+        return res;
+    }
+
+    Mat operator*(const T s) const {
+        Mat res(numRows(), numCols());
+        for (size_t row = 0; row < numRows(); ++row)
+            res[row] = rows[row] * s;
+        return res;
+    }
+
+    Mat operator/(const T s) const {
+        Mat res(numRows(), numCols());
+        for (size_t row = 0; row < numRows(); ++row)
+            res[row] = rows[row] / s;
+        return res;
+    }
+
+    Mat operator*(const Mat& m) const {
+        assert(numCols() == m.numRows() && "operator*: inner dimension mismatch");
+        const size_t N  = numRows();
+        const size_t M  = numCols();
+        const size_t M2 = m.numCols();
+
+        Mat res(N, M2);
+
+        for (size_t row = 0; row < N; ++row) {
+            for (size_t col = 0; col < M2; ++col) {
+                T sum = 0;
+                for (size_t k = 0; k < M; ++k)
+                    sum += rows[row][k] * m[k][col];
+                res[row][col] = sum;
+            }
+        }
+
+        return res;
+    }
+
+    Vec<T> operator*(const Vec<T>& v) const {
+        assert(numCols() == v.size() && "operator*: matrix/vector size mismatch");
+        Vec<T> res(numRows());
+        for (size_t row = 0; row < numRows(); ++row)
+            res[row] = rows[row].dot(v);
+        return res;
+    }
+
+    bool operator==(const Mat& m) const {
+        if (numRows() != m.numRows() || numCols() != m.numCols()) return false;
+        bool res = true;
+        for (size_t row = 0; row < numRows(); ++row)
+            res &= (rows[row] == m[row]);
+        return res;
+    }
+
+    bool operator!=(const Mat& m) const {
+        return !(*this == m);
+    }
+
+
+};
+
+
+
+/* ========================================================================= //
+    Common Matrix Operations
+// ========================================================================= */
+
+/* scalar * Matrix ========================================================= */
+template <typename T> inline Mat<T> operator*(const T s, const Mat<T>& m)
+{ return m * s; }
+
+} // !namespace math::dyn

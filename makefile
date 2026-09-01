@@ -52,3 +52,33 @@ rdbi-nn:
 	mkdir -p bin/rdbi
 	echo "building neural network rdbi..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/nn-demo src/nn-demo.cpp -Werror
+
+debug-nn-dyn:
+	clear
+	mkdir -p bin/debug
+	echo "building dynamic neural network demo..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/nn-demo-dyn src/nn-demo-dyn.cpp -Werror
+
+release-nn-dyn:
+	clear
+	mkdir -p bin/release
+	echo "building dynamic neural network release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/nn-demo-dyn src/nn-demo-dyn.cpp -Werror
+
+rdbi-nn-dyn:
+	clear
+	mkdir -p bin/rdbi
+	echo "building dynamic neural network rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/nn-demo-dyn src/nn-demo-dyn.cpp -Werror
+
+debug-nn-image:
+	clear
+	mkdir -p bin/debug
+	echo "building neural network image demo..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/nn-image-demo src/nn-image-demo.cpp -Werror
+
+release-nn-image:
+	clear
+	mkdir -p bin/release
+	echo "building neural network image release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/nn-image-demo src/nn-image-demo.cpp -Werror

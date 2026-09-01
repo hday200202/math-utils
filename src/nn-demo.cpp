@@ -11,15 +11,20 @@ static constexpr const char* COLOR_GREEN = "\033[32m";
 static constexpr const char* COLOR_RED   = "\033[31m";
 static constexpr const char* COLOR_RESET = "\033[0m";
 
+#define TRAIN
+
+
+#ifdef TRAIN
+
 int main(int argc, char* argv[]) {
     // Classic XOR: not linearly separable, so a working hidden layer is required
     // to solve it - a good sanity check that backprop is actually correct.
-    math::NeuralNetwork<float, 2, 8, 1> nn;
+    math::NeuralNetwork<float, 2, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1> nn;
 
     math::NNConfig<float> cfg;
     cfg.seed                = 42;
     cfg.learningRate        = 0.5f;
-    cfg.epochs              = 10000000;
+    cfg.epochs              = 1000;
     cfg.hiddenActivation    = math::Activation::Tanh;
     cfg.outputActivation    = math::Activation::Sigmoid;
     cfg.loss                = math::Loss::MeanSquaredError;
@@ -30,8 +35,8 @@ int main(int argc, char* argv[]) {
     std::vector<std::pair<math::Vec<2, float>, math::Vec<1, float>>> dataset = {
         {{0.f, 0.f}, {0.f}},
         {{0.f, 1.f}, {1.f}},
-        {{1.f, 0.f}, {0.f}},
-        {{1.f, 1.f}, {1.f}}
+        {{1.f, 0.f}, {1.f}},
+        {{1.f, 1.f}, {0.f}}
     };
 
     auto averageLoss = [&]() {
@@ -72,19 +77,28 @@ int main(int argc, char* argv[]) {
                << (allCorrect ? "All predictions correct!" : "Some predictions incorrect.")
                << COLOR_RESET << std::endl;
 
-    nn.saveWeights(platform::exeDir().string() + "../../data/xor-weights.csv");
+    std::cout << "Saving weights to \"" << platform::exeDir().string() + "/../../data/xor-weights.csv\"" << std::endl;
+    nn.saveWeights(platform::exeDir().string() + "/../../data/xor-weights.csv");
 
     return 0;
 }
 
+#else
 
-// int main() {
-//     math::NeuralNetwork<float, 2, 8, 1> nn;
+int main() {
+    math::NeuralNetwork<float, 2, 8, 1> nn;
+    nn.init({});
 
-//     nn.train({
-//         {{0.f, 0.f}, {0.f}},
-//         {{0.f, 1.f}, {1.f}},
-//         {{1.f, 0.f}, {1.f}},
-//         {{1.f, 1.f}, {1.f}}
-//     });
-// }
+    nn.loadWeights(platform::exeDir().string() + "/../../data/xor-weights.csv");
+
+    auto out = nn.forward(math::Vec<2, float>{0.f, 0.f});
+    std::cout << out << std::endl;
+    out = nn.forward(math::Vec<2, float>{0.f, 1.f});
+    std::cout << out << std::endl;
+    out = nn.forward(math::Vec<2, float>{1.f, 0.f});
+    std::cout << out << std::endl;
+    out = nn.forward(math::Vec<2, float>{1.f, 1.f});
+    std::cout << out << std::endl;
+}
+
+#endif
