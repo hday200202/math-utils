@@ -60,7 +60,7 @@ static_assert(sizeof(Vec2f) == sizeof(float) * 2, "Vec2 has unexpected padding")
     Vec3
 // ========================================================================= */
 
-template <typename T> struct Vec3 { 
+template <typename T> struct Vec3 {
     T x, y, z;
 
     T* data() { return &x; }
@@ -71,7 +71,7 @@ template <typename T> struct Vec3 {
     void normalize() { T mag = magnitude(); x /= mag; y /= mag; z /= mag; }
     T dot(const Vec3& v) const { return x*v.x + y*v.y + z*v.z; }
     Vec3 cross(const Vec3& v) const { return { y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x }; }
-    
+
     Vec3 operator+(const Vec3& v) const { return { x+v.x, y+v.y, z+v.z }; }
     Vec3 operator-(const Vec3& v) const { return { x-v.x, y-v.y, z-v.z }; }
     Vec3 operator*(const T s) const { return { x*s, y*s, z*s }; }
@@ -104,9 +104,9 @@ static_assert(sizeof(Vec3f) == sizeof(float) * 3, "Vec3 has unexpected padding")
     Vec4
 // ========================================================================= */
 
-template <typename T> struct Vec4 { 
+template <typename T> struct Vec4 {
     T x, y, z, w;
-    
+
     T* data() { return &x; }
     const T* data() const { return &x; }
 
@@ -145,158 +145,39 @@ static_assert(sizeof(Vec4f) == sizeof(float) * 4, "Vec4 has unexpected padding")
 
 
 /* ========================================================================= //
-    VecN
-// ========================================================================= */
-
-template <size_t N, typename T> struct Vec {
-    std::array<T, N> v;
-
-    size_t size() const { return v.size(); }
-
-    T* data() { return &v[0]; }
-    const T* data() const { return &v[0]; }
-
-    T magnitudeSq() const {
-        T sum = 0;
-        for (int i = 0; i < v.size(); ++i)
-            sum += v[i] * v[i];
-        return sum;
-    }
-
-    T magnitude() const { return sqrt(magnitudeSq()); }
-
-    void normalize() {
-        T mag = magnitude();
-        for (int i = 0; i < v.size(); ++i) v[i] /= mag;
-    }
-
-    T dot(const Vec& vec) const {
-        T product = 0;
-        for (int i = 0; i < v.size(); ++i) product += (v[i]*vec[i]);
-        return product;
-    }
-
-    Vec operator+(const Vec& vec) const {
-        Vec res;
-        for (int i = 0; i < v.size(); ++i) res[i] = v[i] + vec[i];
-        return res;
-    }
-
-    Vec operator-(const Vec& vec) const {
-        Vec res;
-        for (int i = 0; i < v.size(); ++i) res[i] = v[i] - vec[i];
-        return res;
-    }
-
-    Vec operator*(const T s) const {
-        Vec res;
-        for (int i = 0; i < v.size(); ++i) res[i] = v[i]*s;
-        return res;
-    }
-
-    Vec operator/(const T s) const {
-        Vec res;
-        for (int i = 0; i < v.size(); ++i) res[i] = v[i]/s;
-        return res;
-    }
-
-    Vec operator-() const {
-        Vec res;
-        for (int i = 0; i < v.size(); ++i) res[i] = -v[i];
-        return res;
-    }
-
-    Vec operator+=(const Vec& vec) {
-        for (int i = 0; i < v.size(); ++i) v[i] += vec[i];
-        return *this;
-    }
-
-    Vec operator-=(const Vec& vec) {
-        for (int i = 0; i < v.size(); ++i) v[i] -= vec[i];
-        return *this;
-    }
-
-    Vec operator*=(const T s) {
-        for (int i = 0; i < v.size(); ++i) v[i] *= s;
-        return *this;
-    }
-
-    Vec operator/=(const T s) {
-        for (int i = 0; i < v.size(); ++i) v[i] /= s;
-        return *this;
-    }
-
-    bool operator==(const Vec& vec) const {
-        bool res = true;
-        for (int i = 0; i < v.size(); ++i) res &= (v[i] == vec[i]);
-        return res;
-    }
-
-    bool operator!=(const Vec& vec) const {
-        return !(*this == vec);
-    }
-
-    T& operator[](int i) { return v[i]; }
-    const T& operator[](int i) const { return v[i]; }
-
-    void apply(std::function<T(T)> func) {
-        for (int i = 0; i < N; ++i)
-            v[i] = func(v[i]);
-    }
-};
-
-static_assert(std::is_standard_layout_v<Vec<5, float>>, "Vec<5, float> must be standard-layout");
-static_assert(sizeof(Vec<5, float>) == sizeof(float) * 5, "Vec4 has unexpected padding");
-
-
-
-/* ========================================================================= //
-    Common Vector Operations
+    Common Vector Operations (Vec2/3/4)
 // ========================================================================= */
 
 /* lerp ==================================================================== */
-template <typename T> inline Vec2<T> lerp(const Vec2<T>& a, const Vec2<T>& b, T t) 
+template <typename T> inline Vec2<T> lerp(const Vec2<T>& a, const Vec2<T>& b, T t)
 { Vec2<T> res = a + ((b - a) * t); return res; }
 
-template <typename T> inline Vec3<T> lerp(const Vec3<T>& a, const Vec3<T>& b, T t) 
+template <typename T> inline Vec3<T> lerp(const Vec3<T>& a, const Vec3<T>& b, T t)
 { Vec3<T> res = a + ((b - a) * t); return res; }
 
-template <typename T> inline Vec4<T> lerp(const Vec4<T>& a, const Vec4<T>& b, T t) 
+template <typename T> inline Vec4<T> lerp(const Vec4<T>& a, const Vec4<T>& b, T t)
 { Vec4<T> res = a + ((b - a) * t); return res; }
-
-template <size_t N, typename T> inline Vec<N, T> lerp(const Vec<N, T>& a, const Vec<N, T>& b, T t)
-{ Vec<N, T> res = a + ((b - a) * t); return res; }
 
 
 /* normalize =============================================================== */
-template <typename T> inline Vec2<T> normalize(const Vec2<T>& v) 
+template <typename T> inline Vec2<T> normalize(const Vec2<T>& v)
 { T mag = v.magnitude(); return { v.x / mag, v.y / mag }; }
 
-template <typename T> inline Vec3<T> normalize(const Vec3<T>& v) 
+template <typename T> inline Vec3<T> normalize(const Vec3<T>& v)
 { T mag = v.magnitude(); return { v.x / mag, v.y / mag, v.z / mag }; }
 
-template <typename T> inline Vec4<T> normalize(const Vec4<T>& v) 
+template <typename T> inline Vec4<T> normalize(const Vec4<T>& v)
 { T mag = v.magnitude(); return { v.x / mag, v.y / mag, v.z / mag, v.w / mag }; }
-
-template <size_t N, typename T> inline Vec<N, T> normalize(const Vec<N, T>& v) { 
-    Vec<N, T> res; 
-    T mag = v.magnitude();
-    for (int i = 0; i < v.size(); ++i) res[i] = v[i] / mag;
-    return res;
-}
 
 
 /* distance ================================================================ */
-template <typename T> inline T distance(const Vec2<T>& a, const Vec2<T>& b) 
+template <typename T> inline T distance(const Vec2<T>& a, const Vec2<T>& b)
 { return (b - a).magnitude(); }
 
 template <typename T> inline T distance(const Vec3<T>& a, const Vec3<T>& b)
 { return (b - a).magnitude(); }
 
 template <typename T> inline T distance(const Vec4<T>& a, const Vec4<T>& b)
-{ return (b - a).magnitude(); }
-
-template <size_t N, typename T> inline T distance(const Vec<N, T>& a, const Vec<N, T>& b)
 { return (b - a).magnitude(); }
 
 
@@ -310,9 +191,6 @@ template <typename T> inline T distanceSq(const Vec3<T>& a, const Vec3<T>& b)
 template <typename T> inline T distanceSq(const Vec4<T>& a, const Vec4<T>& b)
 { return (b - a).magnitudeSq(); }
 
-template <size_t N, typename T> inline T distanceSq(const Vec<N, T>& a, const Vec<N, T>& b)
-{ return (b - a).magnitudeSq(); }
-
 
 /* scalar * vec ============================================================ */
 template <typename T> inline Vec2<T> operator*(const T s, const Vec2<T>& v)
@@ -322,9 +200,6 @@ template <typename T> inline Vec3<T> operator*(const T s, const Vec3<T>& v)
 { return v * s; }
 
 template <typename T> inline Vec4<T> operator*(const T s, const Vec4<T>& v)
-{ return v * s; }
-
-template <size_t N, typename T> inline Vec<N, T> operator*(const T s, const Vec<N, T>& v)
 { return v * s; }
 
 
@@ -338,50 +213,38 @@ template <typename T> inline Vec3<T> reflect(const Vec3<T>& v, const Vec3<T>& no
 template <typename T> inline Vec4<T> reflect(const Vec4<T>& v, const Vec4<T>& normal)
 { return v - (2 * v.dot(normal)) * normal; }
 
-template <size_t N, typename T> inline Vec<N, T> reflect(const Vec<N, T>& v, const Vec<N, T> normal)
-{ return v - (2 * v.dot(normal)) * normal;}
-
 
 /* min ===================================================================== */
-template <typename T> inline Vec2<T> min(const Vec2<T>& a, const Vec2<T>& b) 
+template <typename T> inline Vec2<T> min(const Vec2<T>& a, const Vec2<T>& b)
 { return { std::min<T>(a.x, b.x), std::min<T>(a.y, b.y) }; }
 
-template <typename T> inline Vec3<T> min(const Vec3<T>& a, const Vec3<T>& b) 
+template <typename T> inline Vec3<T> min(const Vec3<T>& a, const Vec3<T>& b)
 { return { std::min<T>(a.x, b.x), std::min<T>(a.y, b.y), std::min<T>(a.z, b.z) }; }
 
-template <typename T> inline Vec4<T> min(const Vec4<T>& a, const Vec4<T>& b) 
+template <typename T> inline Vec4<T> min(const Vec4<T>& a, const Vec4<T>& b)
 { return { std::min<T>(a.x, b.x), std::min<T>(a.y, b.y), std::min<T>(a.z, b.z), std::min<T>(a.w, b.w) }; }
-
-template <size_t N, typename T> inline Vec<N, T> min(const Vec<N, T>& a, const Vec<N, T>& b)
-{ Vec<N, T> res; for (int i = 0; i < N; ++i) res[i] = std::min(a[i], b[i]); return res; }
 
 
 /* max ===================================================================== */
-template <typename T> inline Vec2<T> max(const Vec2<T>& a, const Vec2<T>& b) 
+template <typename T> inline Vec2<T> max(const Vec2<T>& a, const Vec2<T>& b)
 { return { std::max<T>(a.x, b.x), std::max<T>(a.y, b.y) }; }
 
-template <typename T> inline Vec3<T> max(const Vec3<T>& a, const Vec3<T>& b) 
+template <typename T> inline Vec3<T> max(const Vec3<T>& a, const Vec3<T>& b)
 { return { std::max<T>(a.x, b.x), std::max<T>(a.y, b.y), std::max<T>(a.z, b.z) }; }
 
-template <typename T> inline Vec4<T> max(const Vec4<T>& a, const Vec4<T>& b) 
+template <typename T> inline Vec4<T> max(const Vec4<T>& a, const Vec4<T>& b)
 { return { std::max<T>(a.x, b.x), std::max<T>(a.y, b.y), std::max<T>(a.z, b.z), std::max<T>(a.w, b.w) }; }
-
-template <size_t N, typename T> inline Vec<N, T> max(const Vec<N, T>& a, const Vec<N, T>& b)
-{ Vec<N, T> res; for (int i = 0; i < N; ++i) res[i] = std::max(a[i], b[i]); return res; }
 
 
 /* clamp =================================================================== */
-template <typename T> inline Vec2<T> clamp(const Vec2<T>& v, const Vec2<T>& lo, const Vec2<T>& hi) 
+template <typename T> inline Vec2<T> clamp(const Vec2<T>& v, const Vec2<T>& lo, const Vec2<T>& hi)
 { return { std::clamp<T>(v.x, lo.x, hi.x), std::clamp<T>(v.y, lo.y, hi.y) }; }
 
-template <typename T> inline Vec3<T> clamp(const Vec3<T>& v, const Vec3<T>& lo, const Vec3<T>& hi) 
+template <typename T> inline Vec3<T> clamp(const Vec3<T>& v, const Vec3<T>& lo, const Vec3<T>& hi)
 { return { std::clamp<T>(v.x, lo.x, hi.x), std::clamp<T>(v.y, lo.y, hi.y), std::clamp<T>(v.z, lo.z, hi.z) }; }
 
-template <typename T> inline Vec4<T> clamp(const Vec4<T>& v, const Vec4<T>& lo, const Vec4<T>& hi) 
+template <typename T> inline Vec4<T> clamp(const Vec4<T>& v, const Vec4<T>& lo, const Vec4<T>& hi)
 { return { std::clamp<T>(v.x, lo.x, hi.x), std::clamp<T>(v.y, lo.y, hi.y), std::clamp<T>(v.z, lo.z, hi.z), std::clamp<T>(v.w, lo.w, hi.w) }; }
-
-template <size_t N, typename T> inline Vec<N, T> clamp(const Vec<N, T>& v, const Vec<N, T>& lo, const Vec<N, T>& hi)
-{ Vec<N, T> res; for (int i = 0; i < N; ++i) res[i] = std::clamp<T>(v[i], lo[i], hi[i]); return res; }
 
 
 /* angle =================================================================== */
@@ -392,9 +255,6 @@ template <typename T> inline T angle(const Vec3<T>& a, const Vec3<T>& b)
 { return std::acos(a.dot(b) / (a.magnitude() * b.magnitude())); }
 
 template <typename T> inline T angle(const Vec4<T>& a, const Vec4<T>& b)
-{ return std::acos(a.dot(b) / (a.magnitude() * b.magnitude())); }
-
-template <size_t N, typename T> inline T angle(const Vec<N, T>& a, const Vec<N, T>& b)
 { return std::acos(a.dot(b) / (a.magnitude() * b.magnitude())); }
 
 
@@ -408,9 +268,6 @@ template <typename T> inline Vec3<T> project(const Vec3<T>& a, const Vec3<T>& b)
 template <typename T> inline Vec4<T> project(const Vec4<T>& a, const Vec4<T>& b)
 { return (a.dot(b) / b.magnitudeSq()) * b; }
 
-template <size_t N, typename T> inline Vec<N, T> project(const Vec<N, T>& a, const Vec<N, T>& b)
-{ return (a.dot(b) / b.magnitudeSq()) * b; }
-
 
 /* reject ================================================================== */
 template <typename T> inline Vec2<T> reject(const Vec2<T>& a, const Vec2<T>& b)
@@ -420,9 +277,6 @@ template <typename T> inline Vec3<T> reject(const Vec3<T>& a, const Vec3<T>& b)
 { return a - project(a, b); }
 
 template <typename T> inline Vec4<T> reject(const Vec4<T>& a, const Vec4<T>& b)
-{ return a - project(a, b); }
-
-template <size_t N, typename T> inline Vec<N, T> reject(const Vec<N, T>& a, const Vec<N, T>& b)
 { return a - project(a, b); }
 
 
@@ -436,42 +290,10 @@ template <typename T> inline Vec3<T> faceforward(const Vec3<T>& n, const Vec3<T>
 template <typename T> inline Vec4<T> faceforward(const Vec4<T>& n, const Vec4<T>& i, const Vec4<T>& nref)
 { return (nref.dot(i) < 0) ? n : -n; }
 
-template <size_t N, typename T> inline Vec<N, T> faceforward(const Vec<N, T>& n, const Vec<N, T>& i, const Vec<N, T>& nref)
-{ return (nref.dot(i) < 0) ? n : -n; }
 
-
-/* apply (to all elements) ================================================= */
-template <size_t N, typename T, typename F> 
-inline Vec<N, T> apply(const Vec<N, T>& v, F func) requires std::is_invocable_r_v<T, F, T> {
-    Vec<N, T> out;
-
-    for (int i = 0; i < N; ++i)
-        out[i] = func(v[i]);
-
-    return out;
-}
-
-template <size_t N, typename T> inline T sum(const Vec<N, T>& v) {
-    T sum = T(0);
-
-    for (size_t i = 0; i < N; ++i)
-        sum += v[i];
-
-    return sum;
-}
-
-
-
-} // !namespace math
 
 /* ========================================================================= //
-    Dynamically allocated counterparts (math::dyn)
-// ========================================================================= */
-
-namespace math::dyn {
-
-/* ========================================================================= //
-    VecN (dynamically allocated)
+    VecN (runtime-sized)
 // ========================================================================= */
 
 template <typename T> struct Vec {
@@ -586,7 +408,7 @@ template <typename T> struct Vec {
 
 
 /* ========================================================================= //
-    Common Vector Operations
+    Common Vector Operations (VecN)
 // ========================================================================= */
 
 /* lerp ==================================================================== */
@@ -690,4 +512,4 @@ template <typename T> inline T sum(const Vec<T>& v) {
     return sum;
 }
 
-} // !namespace math::dyn
+} // !namespace math

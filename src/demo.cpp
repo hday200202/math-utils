@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <string>
 
-#include "../include/Matrix.hpp"
-#include "../include/Printing.hpp"
+#include "../include/math/Matrix.hpp"
+#include "../include/math/Printing.hpp"
+
+using namespace math::utils; // for operator<< on math:: Vec/Mat types (not found via ADL - see math/Printing.hpp)
 
 
 /* ========================================================================= //
@@ -31,12 +33,6 @@ template <typename T> bool isEqual(const math::Vec3<T>& a, const math::Vec3<T>& 
 template <typename T> bool isEqual(const math::Vec4<T>& a, const math::Vec4<T>& b)
 { return isEqual(a.x, b.x) && isEqual(a.y, b.y) && isEqual(a.z, b.z) && isEqual(a.w, b.w); }
 
-template <size_t N, typename T> bool isEqual(const math::Vec<N, T>& a, const math::Vec<N, T>& b) {
-    for (size_t i = 0; i < N; ++i)
-        if (!isEqual(a[i], b[i])) return false;
-    return true;
-}
-
 template <typename T> bool isEqual(const math::Mat2<T>& a, const math::Mat2<T>& b)
 { return isEqual(a[0], b[0]) && isEqual(a[1], b[1]); }
 
@@ -45,13 +41,6 @@ template <typename T> bool isEqual(const math::Mat3<T>& a, const math::Mat3<T>& 
 
 template <typename T> bool isEqual(const math::Mat4<T>& a, const math::Mat4<T>& b)
 { return isEqual(a[0], b[0]) && isEqual(a[1], b[1]) && isEqual(a[2], b[2]) && isEqual(a[3], b[3]); }
-
-// a.rows[i] rather than a[i] — Mat<N,M,T> has no operator[] yet
-template <size_t N, size_t M, typename T> bool isEqual(const math::Mat<N, M, T>& a, const math::Mat<N, M, T>& b) {
-    for (size_t i = 0; i < N; ++i)
-        if (!isEqual(a.rows[i], b.rows[i])) return false;
-    return true;
-}
 
 template <typename T> bool isEqual(const T& a, const T& b) { return a == b; }
 
@@ -67,14 +56,12 @@ void check(const std::string& label, const T& actual, const T& expected) {
 }
 
 
-#define TEST_VEC2 0
-#define TEST_VEC3 0
-#define TEST_VEC4 0
-#define TEST_VECN 0
-#define TEST_MAT2 0
-#define TEST_MAT3 0
-#define TEST_MAT4 0
-#define TEST_MATNXM 1
+#define TEST_VEC2 1
+#define TEST_VEC3 1
+#define TEST_VEC4 1
+#define TEST_MAT2 1
+#define TEST_MAT3 1
+#define TEST_MAT4 1
 
 
 #if TEST_VEC2
@@ -89,20 +76,12 @@ void testVec3();
 void testVec4();
 #endif
 
-#if TEST_VECN
-void testVecN();
-#endif
-
 #if TEST_MAT2
 void testMat2();
 #endif
 
 #if TEST_MAT3
 void testMat3();
-#endif
-
-#if TEST_MATNXM
-void testMatNxM();
 #endif
 
 #if TEST_MAT4
@@ -123,10 +102,6 @@ int main() {
     testVec4();
 #endif
 
-#if TEST_VECN
-    testVecN();
-#endif
-
 #if TEST_MAT2
     testMat2();
 #endif
@@ -137,10 +112,6 @@ int main() {
 
 #if TEST_MAT4
     testMat4();
-#endif
-
-#if TEST_MATNXM
-    testMatNxM();
 #endif
 
     return 0;
@@ -426,102 +397,6 @@ void testVec4() {
     check("faceforward(W, V, U)",  faced,     math::Vec4f{0.f, -1.f, 0.f, 0.f});
 
     std::cout << std::endl;
-}
-#endif
-
-
-#if TEST_VECN
-void testVecN() {
-    math::Vec<5, float> V = {2.f, 2.f, 2.f, 2.f, 2.f};
-    math::Vec<5, float> U = {1.f, 1.f, 1.f, 1.f, 1.f};
-    math::Vec<5, float> W = {0.f, 1.f, 0.f, 0.f, 0.f};   // non-parallel to V, for angle/project/reject/reflect/faceforward
-
-    math::Vec<5, float> add = V + U;
-    math::Vec<5, float> sub = V - U;
-    math::Vec<5, float> mul = V * 2.f;
-    math::Vec<5, float> div = V / 2.f;
-    math::Vec<5, float> neg = -V;
-    math::Vec<5, float> scalarMul = 2.f * V;
-
-    bool eq  = (V == V);
-    bool neq = (V != U);
-
-    float dotVU = V.dot(U);
-    float magSq = V.magnitudeSq();
-    float mag   = V.magnitude();
-
-    math::Vec<5, float> norm = V; norm.normalize();
-    math::Vec<5, float> normFree = math::normalize(V);
-
-    math::Vec<5, float> lerped = math::lerp(V, U, 0.5f);
-
-    float dist   = math::distance(V, U);
-    float distSq = math::distanceSq(V, U);
-
-    math::Vec<5, float> reflected   = math::reflect(V, W);
-    math::Vec<5, float> minVU       = math::min(V, U);
-    math::Vec<5, float> maxVU       = math::max(V, U);
-    math::Vec<5, float> clamped     = math::clamp(V * 3.f, U, V);
-    float                ang         = math::angle(V, W);
-    math::Vec<5, float> projected   = math::project(V, W);
-    math::Vec<5, float> rejected    = math::reject(V, W);
-    math::Vec<5, float> faced       = math::faceforward(W, V, U);
-
-    std::cout << std::endl;
-
-    std::cout << "VecN (N=5):" << std::endl;
-
-    std::cout << "   V: " << V << std::endl;
-    std::cout << "   U: " << U << std::endl;
-    std::cout << "   W: " << W << std::endl;
-
-    std::cout << std::endl;
-
-    check("add",        add,       math::Vec<5, float>{3.f, 3.f, 3.f, 3.f, 3.f});
-    check("sub",        sub,       math::Vec<5, float>{1.f, 1.f, 1.f, 1.f, 1.f});
-    check("mul",        mul,       math::Vec<5, float>{4.f, 4.f, 4.f, 4.f, 4.f});
-    check("div",        div,       math::Vec<5, float>{1.f, 1.f, 1.f, 1.f, 1.f});
-    check("neg",        neg,       math::Vec<5, float>{-2.f, -2.f, -2.f, -2.f, -2.f});
-    check("scalar mul", scalarMul, math::Vec<5, float>{4.f, 4.f, 4.f, 4.f, 4.f});
-
-    std::cout << std::endl;
-
-    check("V == V", eq,  true);
-    check("V != U", neq, true);
-
-    std::cout << std::endl;
-
-    check("dot(V, U)",       dotVU, 10.f);
-    check("magnitudeSq(V)",  magSq, 20.f);
-    check("magnitude(V)",    mag,   4.472136f);
-
-    std::cout << std::endl;
-
-    check("normalize (member, in-place)", norm,     math::Vec<5, float>{0.447214f, 0.447214f, 0.447214f, 0.447214f, 0.447214f});
-    check("normalize (free function)",    normFree, math::Vec<5, float>{0.447214f, 0.447214f, 0.447214f, 0.447214f, 0.447214f});
-
-    std::cout << std::endl;
-
-    check("lerp(V, U, 0.5)", lerped, math::Vec<5, float>{1.5f, 1.5f, 1.5f, 1.5f, 1.5f});
-
-    std::cout << std::endl;
-
-    check("distance(V, U)",        dist,      2.236068f);
-    check("distanceSq(V, U)",      distSq,    5.f);
-    check("reflect(V, W)",         reflected, math::Vec<5, float>{2.f, -2.f, 2.f, 2.f, 2.f});
-    check("min(V, U)",             minVU,     math::Vec<5, float>{1.f, 1.f, 1.f, 1.f, 1.f});
-    check("max(V, U)",             maxVU,     math::Vec<5, float>{2.f, 2.f, 2.f, 2.f, 2.f});
-    check("clamp(V*3, U, V)",      clamped,   math::Vec<5, float>{2.f, 2.f, 2.f, 2.f, 2.f});
-    check("angle(V, W)",           ang,       1.107149f);
-    check("project(V, W)",         projected, math::Vec<5, float>{0.f, 2.f, 0.f, 0.f, 0.f});
-    check("reject(V, W)",          rejected,  math::Vec<5, float>{2.f, 0.f, 2.f, 2.f, 2.f});
-    check("faceforward(W, V, U)",  faced,     math::Vec<5, float>{0.f, -1.f, 0.f, 0.f, 0.f});
-
-    std::cout << std::endl;
-
-    check("size()", V.size(), size_t(5));
-    check("W[0]",   W[0], 0.f);
-    check("W[1]",   W[1], 1.f);
 }
 #endif
 
@@ -842,109 +717,3 @@ void testMat4() {
 }
 #endif
 
-
-#if TEST_MATNXM
-void testMatNxM() {
-    math::Mat<5, 5, float> I = math::Mat<5, 5, float>::identity();
-    std::cout << I << std::endl;
-    // Square (N == M) case — mirrors the Mat2/Mat3/Mat4 pattern exactly,
-    // same numbers as the Mat3 test, so the expected values below are the
-    // same hand-verified ones.
-    math::Mat<3, 3, float> A = {
-        1.f, 2.f, 3.f,
-        4.f, 5.f, 6.f,
-        7.f, 8.f, 9.f
-    };
-    math::Mat<3, 3, float> B = {
-        9.f, 8.f, 7.f,
-        6.f, 5.f, 4.f,
-        3.f, 2.f, 1.f
-    };
-    math::Vec<3, float> v = {1.f, 1.f, 1.f};
-
-    math::Mat<3, 3, float> add    = A + B;
-    math::Mat<3, 3, float> sub    = A - B;
-    math::Mat<3, 3, float> mul    = A * 2.f;
-    math::Mat<3, 3, float> div    = A / 2.f;
-    math::Mat<3, 3, float> matMul = A * B;
-    math::Vec<3, float>    vecMul = A * v;
-
-    bool eq  = (A == A);
-    bool neq = (A != B);
-
-    math::Mat<3, 3, float> t   = A.transpose();
-    float                  det = A.determinant();
-
-    std::cout << std::endl;
-
-    std::cout << "MatNxM (square, 3x3):" << std::endl;
-
-    std::cout << "   A:" << A << std::endl;
-    std::cout << "   B:" << B << std::endl;
-    std::cout << "   v: " << v << std::endl;
-
-    std::cout << std::endl;
-
-    check("add", add, math::Mat<3, 3, float>{10.f, 10.f, 10.f, 10.f, 10.f, 10.f, 10.f, 10.f, 10.f});
-    check("sub", sub, math::Mat<3, 3, float>{-8.f, -6.f, -4.f, -2.f, 0.f, 2.f, 4.f, 6.f, 8.f});
-    check("mul", mul, math::Mat<3, 3, float>{2.f, 4.f, 6.f, 8.f, 10.f, 12.f, 14.f, 16.f, 18.f});
-    check("div", div, math::Mat<3, 3, float>{0.5f, 1.f, 1.5f, 2.f, 2.5f, 3.f, 3.5f, 4.f, 4.5f});
-
-    std::cout << std::endl;
-
-    check("A*B", matMul, math::Mat<3, 3, float>{30.f, 24.f, 18.f, 84.f, 69.f, 54.f, 138.f, 114.f, 90.f});
-    check("A*v", vecMul, math::Vec<3, float>{6.f, 15.f, 24.f});
-
-    std::cout << std::endl;
-
-    check("A == A", eq,  true);
-    check("A != B", neq, true);
-
-    std::cout << std::endl;
-
-    check("transpose(A)", t, math::Mat<3, 3, float>{1.f, 4.f, 7.f, 2.f, 5.f, 8.f, 3.f, 6.f, 9.f});
-
-    std::cout << std::endl;
-
-    // Inverse: A itself is singular (rows in arithmetic progression, same as
-    // the Mat3 test), a separate matrix is used for the invertible case,
-    // verified by checking that M * M.inverse() comes back to identity.
-    check("determinant(A) (0 -> no inverse, not calling .inverse())", det, 0.f);
-
-    std::cout << std::endl;
-
-    math::Mat<3, 3, float> invertible = {
-        1.f, 2.f, 3.f,
-        0.f, 1.f, 4.f,
-        5.f, 6.f, 0.f
-    };   // det = 1
-    math::Mat<3, 3, float> inv = invertible.inverse();
-    std::cout << "invertible:" << invertible << std::endl;
-    check("determinant(invertible)",          invertible.determinant(), 1.f);
-    check("inverse(invertible)",              inv, math::Mat<3, 3, float>{-24.f, 18.f, 5.f, 20.f, -15.f, -4.f, -5.f, 4.f, 1.f});
-    check("invertible * inverse(invertible)", invertible * inv, math::Mat<3, 3, float>::identity());
-
-    std::cout << std::endl;
-
-    check("data()[0]", A.data()[0], 1.f);
-    check("data()[1]", A.data()[1], 2.f);
-    check("data()[2]", A.data()[2], 3.f);
-    check("data()[3]", A.data()[3], 4.f);
-    check("data()[4]", A.data()[4], 5.f);
-    check("data()[5]", A.data()[5], 6.f);
-    check("data()[6]", A.data()[6], 7.f);
-    check("data()[7]", A.data()[7], 8.f);
-    check("data()[8]", A.data()[8], 9.f);
-
-    std::cout << std::endl;
-
-    // Rectangular (N != M) case — construction/basic-op sanity check only.
-    // determinant()/inverse() are correctly *not* callable here (both are
-    // gated with `requires (N == M)`), so deliberately not tested.
-    math::Mat<2, 3, float> R = { 1.f, 2.f, 3.f, 4.f, 5.f, 6.f };
-    std::cout << "R (2x3):" << R << std::endl;
-
-    check("R data()[0]", R.data()[0], 1.f);
-    check("R data()[5]", R.data()[5], 6.f);
-}
-#endif

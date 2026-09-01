@@ -1,4 +1,5 @@
-all: debug-demo release-demo rdbi-demo
+all: debug-demo release-demo rdbi-demo debug-nn-dyn release-nn-dyn rdbi-nn-dyn debug-nn-image release-nn-image debug-invp release-invp debug-ocr release-ocr
+
 debug-demo:
 	clear
 	mkdir -p bin/debug
@@ -35,24 +36,6 @@ rdbi-demo-asm:
 	echo "building demo release with debug info..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -S -o bin/rdbi/demo src/demo.cpp
 
-debug-nn:
-	clear
-	mkdir -p bin/debug
-	echo "building neural network demo..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/nn-demo src/nn-demo.cpp -Werror
-
-release-nn:
-	clear
-	mkdir -p bin/release
-	echo "building neural network release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/nn-demo src/nn-demo.cpp -Werror
-
-rdbi-nn:
-	clear
-	mkdir -p bin/rdbi
-	echo "building neural network rdbi..."
-	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/nn-demo src/nn-demo.cpp -Werror
-
 debug-nn-dyn:
 	clear
 	mkdir -p bin/debug
@@ -82,3 +65,29 @@ release-nn-image:
 	mkdir -p bin/release
 	echo "building neural network image release..."
 	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/nn-image-demo src/nn-image-demo.cpp -Werror
+
+
+debug-invp:
+	clear
+	mkdir -p bin/debug
+	echo "building invoice parser debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/invoice-parser src/invoice-parser.cpp -Werror
+
+release-invp:
+	clear
+	mkdir -p bin/release
+	echo "building invoice parser release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/invoice-parser src/invoice-parser.cpp -Werror
+
+
+debug-ocr:
+	clear
+	mkdir -p bin/debug
+	echo "building ocr demo debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/ocr-demo src/ocr-demo.cpp -Werror
+
+release-ocr:
+	clear
+	mkdir -p bin/release
+	echo "building ocr demo release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/ocr-demo src/ocr-demo.cpp -Werror

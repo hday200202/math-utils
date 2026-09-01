@@ -32,7 +32,7 @@ template <typename T> struct Mat2 {
         return { row1, row2 };
     }
 
-    T determinant() const 
+    T determinant() const
     { return rows[0][0]*rows[1][1] - rows[0][1]*rows[1][0]; }
 
     Mat2 inverse() const {
@@ -47,16 +47,16 @@ template <typename T> struct Mat2 {
     Vec2<T>& operator[](int i) { return rows[i]; }
     const Vec2<T>& operator[](int i) const { return rows[i]; }
 
-    Mat2 operator+(const Mat2& m) const 
+    Mat2 operator+(const Mat2& m) const
     { return { rows[0] + m.rows[0], rows[1] + m.rows[1] }; }
 
-    Mat2 operator-(const Mat2& m) const 
+    Mat2 operator-(const Mat2& m) const
     { return { rows[0] - m.rows[0], rows[1] - m.rows[1] }; }
 
-    Mat2 operator*(const T s) const 
+    Mat2 operator*(const T s) const
     { return { rows[0] * s, rows[1] * s }; }
 
-    Mat2 operator/(const T s) const 
+    Mat2 operator/(const T s) const
     { return { rows[0] / s, rows[1] / s }; }
 
     Mat2 operator*(const Mat2& m) const {
@@ -74,13 +74,13 @@ template <typename T> struct Mat2 {
         return res;
     }
 
-    Vec2<T> operator*(const Vec2<T>& v) const 
+    Vec2<T> operator*(const Vec2<T>& v) const
     { return { v.dot(rows[0]), v.dot(rows[1]) }; }
 
-    bool operator==(const Mat2& m) const 
+    bool operator==(const Mat2& m) const
     { return rows[0] == m.rows[0] && rows[1] == m.rows[1]; }
 
-    bool operator!=(const Mat2& m) const 
+    bool operator!=(const Mat2& m) const
     { return rows[0] != m.rows[0] || rows[1] != m.rows[1]; }
 
     Mat2 operator+=(const Mat2& m)
@@ -156,16 +156,16 @@ template <typename T> struct Mat3 {
     Vec3<T>& operator[](int i) { return rows[i]; }
     const Vec3<T>& operator[](int i) const { return rows[i]; }
 
-    Mat3 operator+(const Mat3& m) const 
+    Mat3 operator+(const Mat3& m) const
     { return { rows[0] + m.rows[0], rows[1] + m.rows[1], rows[2] + m.rows[2] }; }
 
-    Mat3 operator-(const Mat3& m) const 
+    Mat3 operator-(const Mat3& m) const
     { return { rows[0] - m.rows[0], rows[1] - m.rows[1], rows[2] - m.rows[2] }; }
 
-    Mat3 operator*(const T s) const 
+    Mat3 operator*(const T s) const
     { return { rows[0] * s, rows[1] * s, rows[2] * s }; }
 
-    Mat3 operator/(const T s) const 
+    Mat3 operator/(const T s) const
     { return { rows[0] / s, rows[1] / s, rows[2] / s }; }
 
     Mat3 operator*(const Mat3& m) const {
@@ -183,13 +183,13 @@ template <typename T> struct Mat3 {
         return res;
     }
 
-    Vec3<T> operator*(const Vec3<T>& v) const 
+    Vec3<T> operator*(const Vec3<T>& v) const
     { return { v.dot(rows[0]), v.dot(rows[1]), v.dot(rows[2]) }; }
 
-    bool operator==(const Mat3& m) const 
+    bool operator==(const Mat3& m) const
     { return rows[0] == m.rows[0] && rows[1] == m.rows[1] && rows[2] == m.rows[2]; }
 
-    bool operator!=(const Mat3& m) const 
+    bool operator!=(const Mat3& m) const
     { return rows[0] != m.rows[0] || rows[1] != m.rows[1] || rows[2] != m.rows[2]; }
 
     Mat3 operator+=(const Mat3& m)
@@ -313,16 +313,16 @@ template <typename T> struct Mat4 {
     Vec4<T>& operator[](int i) { return rows[i]; }
     const Vec4<T>& operator[](int i) const { return rows[i]; }
 
-    Mat4 operator+(const Mat4& m) const 
+    Mat4 operator+(const Mat4& m) const
     { return { rows[0] + m.rows[0], rows[1] + m.rows[1], rows[2] + m.rows[2], rows[3] + m.rows[3] }; }
 
-    Mat4 operator-(const Mat4& m) const 
+    Mat4 operator-(const Mat4& m) const
     { return { rows[0] - m.rows[0], rows[1] - m.rows[1], rows[2] - m.rows[2], rows[3] - m.rows[3] }; }
 
-    Mat4 operator*(const T s) const 
+    Mat4 operator*(const T s) const
     { return { rows[0] * s, rows[1] * s, rows[2] * s, rows[3] * s }; }
 
-    Mat4 operator/(const T s) const 
+    Mat4 operator/(const T s) const
     { return { rows[0] / s, rows[1] / s, rows[2] / s, rows[3] / s }; }
 
     Mat4 operator*(const Mat4& m) const {
@@ -340,13 +340,13 @@ template <typename T> struct Mat4 {
         return res;
     }
 
-    Vec4<T> operator*(const Vec4<T>& v) const 
+    Vec4<T> operator*(const Vec4<T>& v) const
     { return { v.dot(rows[0]), v.dot(rows[1]), v.dot(rows[2]), v.dot(rows[3]) }; }
 
-    bool operator==(const Mat4& m) const 
+    bool operator==(const Mat4& m) const
     { return rows[0] == m.rows[0] && rows[1] == m.rows[1] && rows[2] == m.rows[2] && rows[3] == m.rows[3]; }
 
-    bool operator!=(const Mat4& m) const 
+    bool operator!=(const Mat4& m) const
     { return rows[0] != m.rows[0] || rows[1] != m.rows[1] || rows[2] != m.rows[2] || rows[3] != m.rows[3]; }
 
     Mat4 operator+=(const Mat4& m)
@@ -373,166 +373,7 @@ static_assert(sizeof(Mat4f) == sizeof(float) * 16, "Mat4 has unexpected padding"
 
 
 /* ========================================================================= //
-    MatNxM
-// ========================================================================= */
-
-template <size_t N, size_t M, typename T> struct Mat {
-    Vec<M, T> rows[N] = {0};
-
-    T* data() { return &rows[0][0]; }
-    const T* data() const { return &rows[0][0]; }
-
-    static Mat identity() requires ( N == M ) {
-        Mat res;
-        int oneIdx = 0;
-        for (int row = 0; row < N; ++row)
-            res[row][row] = 1;
-        return res;
-    }
-
-    Mat<M, N, T> transpose() const {
-        Mat<M, N, T> res;
-
-        for (int row = 0; row < N; ++row) {
-            for (int col = 0; col < M; ++col)
-                res[col][row] = rows[row][col];
-        }
-
-        return res;
-    }
-
-    T determinant() const requires ( N == M ) {
-        Mat copy = *this;
-        T det = T(1);
-        int sign = 1;
-
-        for (size_t col = 0; col < N; ++col) {
-            size_t pivotRow = col;
-            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
-
-            if (pivotRow == N) return T(0);
-
-            if (pivotRow != col) {
-                std::swap(copy.rows[pivotRow], copy.rows[col]);
-                sign = -sign;
-            }
-
-            for (size_t row = col + 1; row < N; ++row) {
-                T factor = copy[row][col] / copy[col][col];
-                for (size_t k = col; k < N; ++k)
-                    copy[row][k] -= factor * copy[col][k];
-            }
-        }
-
-        for (size_t i = 0; i < N; ++i) det *= copy[i][i];
-        return sign * det;
-    }
-
-    Mat inverse() const requires ( N == M ) {
-        Mat copy = *this;
-        Mat result;
-        for (size_t i = 0; i < N; ++i) result[i][i] = T(1);
-
-        for (size_t col = 0; col < N; ++col) {
-            size_t pivotRow = col;
-            while (pivotRow < N && copy[pivotRow][col] == T(0)) ++pivotRow;
-
-            if (pivotRow != col) {
-                std::swap(copy.rows[pivotRow], copy.rows[col]);
-                std::swap(result.rows[pivotRow], result.rows[col]);
-            }
-
-            T pivot = copy[col][col];
-            for (size_t k = 0; k < N; ++k) {
-                copy[col][k]   /= pivot;
-                result[col][k] /= pivot;
-            }
-
-            for (size_t row = 0; row < N; ++row) {
-                if (row == col) continue;
-                T factor = copy[row][col];
-                for (size_t k = 0; k < N; ++k) {
-                    copy[row][k]   -= factor * copy[col][k];
-                    result[row][k] -= factor * result[col][k];
-                }
-            }
-        }
-
-        return result;
-    }
-
-    Vec<M, T>& operator[](int i) { return rows[i]; }
-    const Vec<M, T>& operator[](int i) const { return rows[i]; }
-
-    Mat operator+(const Mat& m) const {
-        Mat res;
-        for (int row = 0; row < N; ++row)
-            res[row] = rows[row] + m[row];
-        return res;
-    }
-
-    Mat operator-(const Mat& m) const {
-        Mat res;
-        for (int row = 0; row < N; ++row)
-            res[row] = rows[row] - m[row];
-        return res;
-    }
-
-    Mat operator*(const T s) const {
-        Mat res;
-        for (int row = 0; row < N; ++row)
-            res[row] = rows[row] * s;
-        return res;
-    }
-
-    Mat operator/(const T s) const {
-        Mat res;
-        for (int row = 0; row < N; ++row)
-            res[row] = rows[row] / s;
-        return res;
-    }
-
-    template <size_t M2>
-    Mat<N, M2, T> operator*(const Mat<M, M2, T>& m) const {
-        Mat<N, M2, T> res;
-
-        for (int row = 0; row < N; ++row) {
-            for (int col = 0; col < M2; ++col) {
-                T sum = 0;
-                for (int k = 0; k < M; ++k)
-                    sum += rows[row][k] * m[k][col];
-                res[row][col] = sum;
-            }
-        }
-
-        return res;
-    }
-
-    Vec<N, T> operator*(const Vec<M, T>& v) const {
-        Vec<N, T> res;
-        for (int row = 0; row < N; ++row)
-            res[row] = rows[row].dot(v);
-        return res;
-    }
-
-    bool operator==(const Mat& m) {
-        bool res = true;
-        for (int row = 0; row < N; ++row)
-            res &= (rows[row] == m[row]);
-        return res;
-    }
-
-    bool operator!=(const Mat& m) {
-        return !(*this == m);
-    }
-
-
-};
-
-
-
-/* ========================================================================= //
-    Common Matrix Operations
+    Common Matrix Operations (Mat2/3/4)
 // ========================================================================= */
 
 /* scalar * Matrix ========================================================= */
@@ -545,16 +386,10 @@ template <typename T> inline Mat3<T> operator*(const T s, const Mat3<T>& m)
 template <typename T> inline Mat4<T> operator*(const T s, const Mat4<T>& m)
 { return { s*m.rows[0], s*m.rows[1], s*m.rows[2], s*m.rows[3] }; }
 
-}
+
 
 /* ========================================================================= //
-    Dynamically allocated counterparts (math::dyn)
-// ========================================================================= */
-
-namespace math::dyn {
-
-/* ========================================================================= //
-    MatNxM (dynamically allocated)
+    MatNxM (runtime-sized)
 // ========================================================================= */
 
 template <typename T> struct Mat {
@@ -732,18 +567,16 @@ template <typename T> struct Mat {
     bool operator!=(const Mat& m) const {
         return !(*this == m);
     }
-
-
 };
 
 
 
 /* ========================================================================= //
-    Common Matrix Operations
+    Common Matrix Operations (MatNxM)
 // ========================================================================= */
 
 /* scalar * Matrix ========================================================= */
 template <typename T> inline Mat<T> operator*(const T s, const Mat<T>& m)
 { return m * s; }
 
-} // !namespace math::dyn
+} // !namespace math
