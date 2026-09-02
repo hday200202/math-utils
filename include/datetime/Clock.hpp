@@ -3,7 +3,7 @@
 #include <chrono>
 #include <unordered_map>
 
-namespace utils {
+namespace dtm {
 
 class Clock {
 public:

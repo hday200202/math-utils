@@ -6,6 +6,8 @@
 #include <vector>
 #include <chrono>
 
+#include "../datetime/Datetime.hpp"
+
 namespace files {
 
 namespace fs = std::filesystem;
