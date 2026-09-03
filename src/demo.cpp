@@ -6,8 +6,6 @@
 #include "../include/math/Matrix.hpp"
 #include "../include/math/Printing.hpp"
 
-using namespace math::utils; // for operator<< on math:: Vec/Mat types (not found via ADL - see math/Printing.hpp)
-
 
 /* ========================================================================= //
     Test-check helpers: prints a green [PASS] or red [FAIL] line for each

@@ -1,4 +1,4 @@
-all: debug-demo release-demo rdbi-demo debug-nn-dyn release-nn-dyn rdbi-nn-dyn debug-nn-image release-nn-image debug-invp release-invp debug-ocr release-ocr
+all: debug-demo release-demo rdbi-demo debug-time release-time rdbi-time
 
 debug-demo:
 	clear
@@ -35,3 +35,21 @@ rdbi-time:
 	mkdir -p bin/rdbi
 	echo "building time demo rdbi..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/time src/time.cpp -Werror -Wall
+
+debug-ocr:
+	clear
+	mkdir -p bin/debug
+	echo "building ocr demo debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/ocr src/ocr.cpp -ltesseract -lleptonica -Werror -Wall
+
+release-ocr:
+	clear
+	mkdir -p bin/release
+	echo "building ocr demo release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/ocr src/ocr.cpp -ltesseract -lleptonica -Werror -Wall
+
+rdbi-ocr:
+	clear
+	mkdir -p bin/rdbi
+	echo "building ocr demo rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/ocr src/ocr.cpp -ltesseract -lleptonica -Werror -Wall

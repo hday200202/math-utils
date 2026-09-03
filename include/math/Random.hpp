@@ -42,4 +42,4 @@ template <typename T> math::Mat<T> randomMat(std::mt19937& rng, size_t n, size_t
     return out;
 }
 
-} // !namespace math::utils
+} // !namespace math::random

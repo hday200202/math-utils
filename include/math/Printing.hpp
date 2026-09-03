@@ -108,7 +108,7 @@ template <typename T> std::ostream& operator<<(std::ostream& os, const math::Vec
 
 
 /* ========================================================================= //
-    VecN / MatNxM (runtime-sized) - same math::utils namespace as Vec2/3/4
+    VecN / MatNxM (runtime-sized) - same math namespace as Vec2/3/4
 // ========================================================================= */
 
 template <typename T> std::ostream& operator<<(std::ostream& os, const math::Mat<T>& m) {
@@ -153,4 +153,4 @@ template <typename T> std::ostream& operator<<(std::ostream& os, const math::Vec
     return os;
 }
 
-} // !namespace math::utils
+} // !namespace math

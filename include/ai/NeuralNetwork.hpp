@@ -2,7 +2,7 @@
 
 #include <vector>
 #include <algorithm>
-#include <fstream>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <iostream>
@@ -12,14 +12,16 @@
 #include <random>
 
 #include "../math/Math.hpp"
+#include "../files/File.hpp"
 
 /*
-    math::Vec<T>/math::Mat<T> are class templates, not overloads of anything -
-    a plain `using namespace math;` would be safe here (nothing else in math
-    is named Vec/Mat), so they're spelled out fully qualified anyway just to
-    keep this file's types visually distinct from math::ai's/math::utils's
-    function templates, which DO get plain using-directives below (safe,
-    since sigmoid/hadamard/etc. are overloaded, not redeclared).
+    Everything from outside this namespace is spelled out fully qualified -
+    math::Vec<T>/math::Mat<T> for the types, math::random:: for the weight
+    initialisers. A `using namespace` would read more cleanly at the call
+    sites, but in a header it applies to every translation unit that
+    includes this one, so the names it pulls in are not this file's to
+    decide. sigmoid/hadamard/etc. need no qualification: ai/Math.hpp puts
+    them in this same ai namespace.
 */
 
 namespace ai {
@@ -296,9 +298,16 @@ template <typename T> struct NeuralNetwork {
     }
 
 
-    bool saveWeights(const std::string& path) const {
-        std::ofstream out(path);
-        if (!out) return false;
+    /*
+        saveWeights(path):
+        - the whole file is built in memory first and handed to files::File in
+          one write. File deals in whole strings rather than a stream, so
+          there is nothing to format into incrementally
+        - OpenMode::Write creates the file if it is missing and truncates it
+          if it is not, which is what overwriting a set of weights should do
+    */
+    bool saveWeights(const std::filesystem::path& path) const {
+        std::ostringstream out;
 
         // default ostream precision is 6 significant digits, which is not
         // enough to round-trip a float (needs max_digits10, 9 for float)
@@ -310,13 +319,24 @@ template <typename T> struct NeuralNetwork {
 
         for (const auto& layer : layers) saveLayer(layer, out);
 
-        return static_cast<bool>(out);
+        files::File file;
+        if (!file.open(path, files::OpenMode::Write)) return false;
+
+        return file.write(out.str());
     }
 
 
-    bool loadWeights(const std::string& path) {
-        std::ifstream in(path);
-        if (!in) return false;
+    /*
+        loadWeights(path):
+        - reads the file in one go and parses out of the string. The parsing
+          itself is unchanged: >> on a stringstream extracts whitespace
+          separated numbers exactly as it did on the ifstream
+    */
+    bool loadWeights(const std::filesystem::path& path) {
+        files::File file;
+        if (!file.open(path, files::OpenMode::Read)) return false;
+
+        std::istringstream in(file.text());
 
         size_t count = 0;
         in >> count;
@@ -360,8 +380,8 @@ private:
         T mean,
         T stddev
     ) {
-        layer.weights   = randomMat<T>(rng, layer.outSize(), layer.inSize(), mean, stddev);
-        layer.bias      = randomVec<T>(rng, layer.outSize(), mean, stddev);
+        layer.weights   = math::random::randomMat<T>(rng, layer.outSize(), layer.inSize(), mean, stddev);
+        layer.bias      = math::random::randomVec<T>(rng, layer.outSize(), mean, stddev);
     }
 
 
@@ -432,7 +452,7 @@ private:
 
     void saveLayer(
         const Layer<T>& layer,
-        std::ofstream& out
+        std::ostringstream& out
     ) const {
         for (size_t i = 0; i < layer.outSize(); ++i)
             for (size_t j = 0; j < layer.inSize(); ++j)
@@ -446,7 +466,7 @@ private:
 
     void loadLayer(
         Layer<T>& layer,
-        std::ifstream& in
+        std::istringstream& in
     ) {
         for (size_t i = 0; i < layer.outSize(); ++i)
             for (size_t j = 0; j < layer.inSize(); ++j)

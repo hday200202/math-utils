@@ -274,4 +274,4 @@ template <typename T> math::Vec<T> crossEntropyPrime(const math::Vec<T>& predict
     return out;
 }
 
-} // !namespace math::ai
+} // !namespace ai
