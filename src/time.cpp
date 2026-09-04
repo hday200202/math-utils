@@ -10,12 +10,23 @@ int main(int argc, char* argv[]) {
     Timestamp ts(Clock::now().asSeconds());
     std::cout << ts.toString(DTMFormat::LE | DTMFormat::HM12) << std::endl;
 
+    
     structs::LinkedList<float> ll;
-    ll.append(2);
-    ll.prepend(1);
-    ll.append(3);
+    
+    std::cout << ll.getRoot() << std::endl;
 
-    std::cout << ll[2] << std::endl;
+    ll.append(1);
+    ll.append(2);
+    ll.append(3);
+    ll.append(4);
+
+    for (size_t i = 0; i < ll.size(); ++i)
+        std::cout << ll[i] << std::endl;
+
+    ll.erase(0);
+
+    for (size_t i = 0; i < ll.size(); ++i)
+        std::cout << ll[i] << std::endl;
 
     return 0;
 }
