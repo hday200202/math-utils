@@ -22,19 +22,19 @@ debug-time:
 	clear
 	mkdir -p bin/debug
 	echo "building time demo debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/time src/time.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/time src/time.cpp
 
 release-time:
 	clear
 	mkdir -p bin/release
 	echo "building time demo release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/time src/time.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/time src/time.cpp
 
 rdbi-time:
 	clear
 	mkdir -p bin/rdbi
 	echo "building time demo rdbi..."
-	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/time src/time.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/time src/time.cpp
 
 debug-ocr:
 	clear

@@ -7,26 +7,31 @@
 int main(int argc, char* argv[]) {
     using namespace dtm;
 
-    Timestamp ts(Clock::now().asSeconds());
-    std::cout << ts.toString(DTMFormat::LE | DTMFormat::HM12) << std::endl;
+    std::vector<float> a;
+    std::vector<float> b;
 
-    
+    Clock idxClock;
+    Clock itrClock;
+
     structs::LinkedList<float> ll;
-    
-    std::cout << ll.getRoot() << std::endl;
+    for (int i = 0; i < 1000000; ++i) ll.append(i);
 
-    ll.append(1);
-    ll.append(2);
-    ll.append(3);
-    ll.append(4);
+    idxClock.start();
+    // for (size_t i = 0; i < ll.size(); ++i) a.push_back(ll[i]->data());
+    idxClock.stop();
 
-    for (size_t i = 0; i < ll.size(); ++i)
-        std::cout << ll[i] << std::endl;
+    std::cout << std::endl;
 
-    ll.erase(0);
+    itrClock.start();
+    for (auto& node : ll) b.push_back(node);
+    itrClock.stop();
 
-    for (size_t i = 0; i < ll.size(); ++i)
-        std::cout << ll[i] << std::endl;
+    std::cout << "   Index Time: " << idxClock.elapsed().asMillis() << " ms" << std::endl;
+    std::cout << "Iterator Time: " << itrClock.elapsed().asMillis() << " ms" << std::endl;
+    std::cout 
+        << "Iterator is " << 
+            idxClock.elapsed().asMillis() / itrClock.elapsed().asMillis() 
+        << "X faster. " << std::endl;
 
     return 0;
 }

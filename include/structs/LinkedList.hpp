@@ -19,7 +19,10 @@ public:
     friend std::ostream& operator<<(
         std::ostream& os, 
         const LLNode<T>* node
-    ) { os << (node ? std::to_string(node->m_data) : "nullptr"); return os; }
+    ) { 
+        if (node)   { os << node->m_data;   return os; }
+        else        { os << "nullptr";      return os; }
+    }
 
 protected:
     LLNode* m_next = nullptr;
@@ -32,31 +35,46 @@ public:
     LinkedList() = default;
     ~LinkedList() { cleanup(); }
 
+    LinkedList(const LinkedList& ll) {
+        for (auto* n = ll.getRoot(); n; n = n->getNext()) append(n->data());
+    }
+
+    LinkedList& operator=(LinkedList ll) {
+        std::swap(m_root, ll.m_root);
+        std::swap(m_tail, ll.m_tail);
+        std::swap(m_size, ll.m_size);
+        return *this;
+    }
+
     LLNode<T>* getRoot() const { return m_root; }
     LLNode<T>* getTail() const { return m_tail; }
     size_t size() const { return m_size; }
 
-    void append(const T& data) {
-        if (m_root == nullptr) { init(data); return; }
+    LinkedList& append(const T& data) {
+        if (m_root == nullptr) { init(data); return *this; }
 
         auto prevTail = m_tail;
         m_tail->setNext(new LLNode<T>(data));
         m_tail = m_tail->getNext();
         m_tail->setPrev(prevTail);
         ++m_size;
+
+        return *this;
     }
 
-    void prepend(const T& data) {
-        if (m_root == nullptr) { init(data); return; }
+    LinkedList& prepend(const T& data) {
+        if (m_root == nullptr) { init(data); return *this; }
 
         auto prevRoot = m_root;
         m_root->setPrev(new LLNode<T>(data));
         m_root = m_root->getPrev();
         m_root->setNext(prevRoot);
         ++m_size;
+
+        return *this;
     }
 
-    void erase(const size_t index) {
+    LinkedList& erase(const size_t index) {
         LLNode<T>* node = at(index);
 
         LLNode<T>* prev = node->getPrev();
@@ -69,6 +87,8 @@ public:
         else                        { m_tail = nullptr; m_root = nullptr;       delete node; }
 
         --m_size;
+
+        return *this;
     }
 
     LLNode<T>* at(const size_t i) const {
@@ -77,7 +97,7 @@ public:
                 "Index [" + std::to_string(i) + "] is out of range."
             );
 
-        int dir = (i < ((m_size - 1) / 2));
+        int dir = (i < m_size / 2);
         size_t idx = (!dir) * (m_size - 1);
         LLNode<T>* curr = dir ? m_root : m_tail;
         int inc = (dir * 2) - 1;
@@ -89,6 +109,21 @@ public:
     }
 
     LLNode<T>* operator[](const size_t i) const { return at(i); }
+
+    class Iterator {
+    public:
+        explicit Iterator(LLNode<T>* node) : m_node(node) {}
+        
+        T& operator*() const { return m_node->data(); }
+        Iterator& operator++() { m_node = m_node->getNext(); return *this; }
+        bool operator==(const Iterator& o) const { return m_node == o.m_node; }
+
+    private:
+        LLNode<T>* m_node;
+    };
+
+    Iterator begin()    { return Iterator(m_root); }
+    Iterator end()      { return Iterator(nullptr); }
 
 private:
     LLNode<T>* m_root = nullptr;
