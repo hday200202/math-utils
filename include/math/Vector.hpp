@@ -61,7 +61,11 @@ static_assert(sizeof(Vec2f) == sizeof(float) * 2, "Vec2 has unexpected padding")
 // ========================================================================= */
 
 template <typename T> struct Vec3 {
-    T x, y, z;
+    union {
+        struct { T x, y, z; };
+        Vec2<T> xy;
+        struct { T _sx; Vec2<T> yz; };
+    };
 
     T* data() { return &x; }
     const T* data() const { return &x; }
@@ -82,6 +86,8 @@ template <typename T> struct Vec3 {
     Vec3 operator-=(const Vec3& v) { x -= v.x; y -= v.y; z -= v.z; return *this; }
     Vec3 operator*=(const T s) { x *= s; y *= s; z *= s; return *this; }
     Vec3 operator/=(const T s) { x /= s; y /= s; z /= s; return *this; }
+
+    Vec2<T> xz() const { return {x, z}; }
 
     bool operator==(const Vec3& v) const { return x == v.x && y == v.y && z == v.z; }
     bool operator!=(const Vec3& v) const { return !(*this == v); }
@@ -105,7 +111,14 @@ static_assert(sizeof(Vec3f) == sizeof(float) * 3, "Vec3 has unexpected padding")
 // ========================================================================= */
 
 template <typename T> struct Vec4 {
-    T x, y, z, w;
+    union {
+        struct { T x, y, z, w; };
+        Vec2<T> xy;
+        Vec3<T> xyz;
+        struct { T _sx;      Vec2<T> yz;  };
+        struct { T _sx2;     Vec3<T> yzw; };
+        struct { T _sx3, _sy3; Vec2<T> zw; };
+    };
 
     T* data() { return &x; }
     const T* data() const { return &x; }
@@ -126,6 +139,12 @@ template <typename T> struct Vec4 {
     Vec4 operator-=(const Vec4& v) { x -= v.x; y -= v.y; z -= v.z; w -= v.w; return *this; }
     Vec4 operator*=(const T s) { x *= s; y *= s; z *= s; w *= s; return *this; }
     Vec4 operator/=(const T s) { x /= s; y /= s; z /= s; w /= s; return *this; }
+
+    Vec2<T> xz() const { return {x, z}; }
+    Vec2<T> xw() const { return {x, w}; }
+    Vec2<T> yw() const { return {y, w}; }
+    Vec3<T> xyw() const { return {x, y, w}; }
+    Vec3<T> xzw() const { return {x, z, w}; }
 
     bool operator==(const Vec4& v) const { return x == v.x && y == v.y && z == v.z && w == v.w; }
     bool operator!=(const Vec4& v) const { return !(*this == v); }

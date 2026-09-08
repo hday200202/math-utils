@@ -53,3 +53,56 @@ rdbi-ocr:
 	mkdir -p bin/rdbi
 	echo "building ocr demo rdbi..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/ocr src/ocr.cpp -ltesseract -lleptonica -Werror -Wall
+
+debug-random:
+	clear
+	mkdir -p bin/debug
+	echo "building random demo debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/random src/random.cpp -Werror -Wall
+
+release-random:
+	clear
+	mkdir -p bin/release
+	echo "building random demo release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/random src/random.cpp -Werror -Wall
+
+rdbi-random:
+	clear
+	mkdir -p bin/rdbi
+	echo "building random demo rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/random src/random.cpp -Werror -Wall
+
+debug-neuralnet:
+	clear
+	mkdir -p bin/debug
+	echo "building neuralnet demo debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/neuralnet src/neuralnet.cpp -Werror -Wall
+
+release-neuralnet:
+	clear
+	mkdir -p bin/release
+	echo "building neuralnet demo release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/neuralnet src/neuralnet.cpp -Werror -Wall
+
+rdbi-neuralnet:
+	clear
+	mkdir -p bin/rdbi
+	echo "building neuralnet demo rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/neuralnet src/neuralnet.cpp -Werror -Wall
+debug-quat:
+	clear
+	mkdir -p bin/debug
+	echo "building quaternion tests debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/quat-testing src/quat-testing.cpp -Werror -Wall
+
+release-quat:
+	clear
+	mkdir -p bin/release
+	echo "building quaternion tests release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -o bin/release/quat-testing src/quat-testing.cpp -Werror -Wall
+
+rdbi-quat:
+	clear
+	mkdir -p bin/rdbi
+	echo "building quaternion tests rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/quat-testing src/quat-testing.cpp -Werror -Wall

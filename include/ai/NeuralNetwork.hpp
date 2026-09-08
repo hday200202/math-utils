@@ -9,7 +9,6 @@
 #include <iomanip>
 #include <limits>
 #include <cassert>
-#include <random>
 
 #include "../math/Math.hpp"
 #include "../files/File.hpp"
@@ -149,7 +148,7 @@ template <typename T> struct NeuralNetwork {
     std::vector<Layer<T>> layers;
     std::vector<size_t> sizes;
     NNConfig<T> cfg = {};
-    std::mt19937 rng;
+    math::random::Random rng{0};   // reseeded from cfg.seed in init()
 
 
     NeuralNetwork() = default;
@@ -376,7 +375,7 @@ private:
 
     void randomizeLayer(
         Layer<T>& layer,
-        std::mt19937& rng,
+        math::random::Random& rng,
         T mean,
         T stddev
     ) {
