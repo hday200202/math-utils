@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include "Matrix.hpp"
 
 namespace math {
@@ -22,6 +23,9 @@ template <typename T> struct Quat {
     Quat operator-() const { return {-v, -w}; }
     T dot(const Quat& q) const { return v.dot(q.v) + w * q.w; }
 
+    bool operator==(const Quat& q) const { return (v == q.v && w == q.w); }
+    bool operator!=(const Quat& q) const { return !(*this == q); }
+
     void normalize() { T n = norm(); v /= n; w /= n; }
     T normSq() const { return v.magnitudeSq() + (w*w); }
     T norm() const { return std::sqrt(normSq()); }
@@ -41,13 +45,76 @@ template <typename T> struct Quat {
             {2*(v.x*v.z - w*v.y),       2*(v.y*v.z + w*v.x),        1 - 2*(v.x*v.x + v.y*v.y)},
         }};
     }
+
+    Mat4<T> toMat4() const {
+        return Mat4<T>::fromMat3(toMat3());
+    }
     
     static Quat identity() { return {{0, 0, 0}, T(1)}; }
     static Quat fromAxisAngle(const Vec3<T>& axis, const T theta) {
         T half = theta / T(2);
         return {math::normalize(axis) * std::sin(half), std::cos(half)};
     }
+    void toAxisAngle(Vec3<T>& axis, T& angle) const {
+        T len = v.magnitude();
+        if (len < std::numeric_limits<T>::epsilon() * T(10)) {
+            axis = {T(1), T(0), T(0)};
+            angle = T(0);
+            return;
+        }
+        angle = T(2) * std::atan2(len, w);
+        axis = v / len;
+    }
+    static Quat fromMat3(const Mat3<T>& m) {
+        T trace = m[0][0] + m[1][1] + m[2][2];
+        T s;
+
+        if (trace > 0) {
+            s = std::sqrt(trace + 1) * 2;
+            return {
+                {(m[2][1] - m[1][2]) / s, 
+                (m[0][2] - m[2][0]) / s, 
+                (m[1][0] - m[0][1]) / s}, 
+                s / 4
+            };
+        }
+
+        else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+            s = std::sqrt(1 + m[0][0] - m[1][1] - m[2][2]) * 2;
+            return {
+                {s / 4, 
+                (m[0][1] + m[1][0]) / s, 
+                (m[0][2] + m[2][0]) / s}, 
+                (m[2][1] - m[1][2]) / s
+            };
+        }
+
+        else if (m[1][1] > m[2][2]) {
+            s = std::sqrt(1 - m[0][0] + m[1][1] - m[2][2]) * 2;
+            return {
+                {(m[0][1] + m[1][0]) / s,
+                s / 4,
+                (m[1][2] + m[2][1]) / s},
+                (m[0][2] - m[2][0]) / s
+            };
+        }
+
+        else {
+            s = std::sqrt(1 - m[0][0] - m[1][1] + m[2][2]) * 2;
+            return {
+                {(m[0][2] + m[2][0]) / s,
+                (m[1][2] + m[2][1]) / s,
+                s / 4},
+                (m[1][0] - m[0][1]) / s
+            };
+        }
+    }
 };
+
+using Quatf = Quat<float>;
+using Quatd = Quat<double>;
+using Quati = Quat<int32_t>;
+using Quatu = Quat<uint32_t>;
 
 static_assert(sizeof(Quat<float>) == sizeof(float) * 4);
 
@@ -63,6 +130,11 @@ template <typename T> inline Quat<T> slerp(Quat<T> a, const Quat<T>& b, T t) {
     T theta = std::acos(d);
     T s = std::sin(theta);
     return a * (std::sin((T(1) - t) * theta) / s) + b * (std::sin(t * theta) / s);
+}
+
+template <typename T> inline Quat<T> normalize(const Quat<T>& q) {
+    T n = q.norm(); 
+    return {q.v / n, q.w / n};
 }
 
 }

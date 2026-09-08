@@ -20,7 +20,9 @@ static int failures = 0;
 
 using Quatf = math::Quat<float>;
 using math::Vec3f;
+using math::Vec4f;
 using math::Mat3f;
+using math::Mat4f;
 
 static constexpr float PI = 3.14159265358979f;
 
@@ -32,6 +34,12 @@ inline bool isEqual(const Quatf& a, const Quatf& b)
 inline bool isEqual(const Mat3f& a, const Mat3f& b) {
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
+            if (!isEqual(a[i][j], b[i][j])) return false;
+    return true;
+}
+inline bool isEqual(const Mat4f& a, const Mat4f& b) {
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
             if (!isEqual(a[i][j], b[i][j])) return false;
     return true;
 }
@@ -279,12 +287,323 @@ static void testSlerp() {
 }
 
 
+/* ========================================================================= //
+    fromMat3 (matrix -> quaternion)
+// ========================================================================= */
+
+static void testFromMat3() {
+    section("fromMat3");
+
+    check("fromMat3(identity) is identity",
+          sameRotation(Quatf::fromMat3(Mat3f::identity()), Quatf::identity()));
+
+    Quatf q = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
+    check("fromMat3 round-trips", sameRotation(Quatf::fromMat3(q.toMat3()), q));
+
+    // Shepperd's method branches on which of w/x/y/z is largest. The three
+    // axis-aligned 180 degree rotations are the trace <= 0 cases, one per
+    // vector-component branch -- these are what the naive sqrt(1 + trace)
+    // form divides by zero on.
+    Quatf flipX = Quatf::fromAxisAngle({1, 0, 0}, PI);
+    Quatf flipY = Quatf::fromAxisAngle({0, 1, 0}, PI);
+    Quatf flipZ = Quatf::fromAxisAngle({0, 0, 1}, PI);
+    check("fromMat3 handles 180 degrees about X (x branch)",
+          sameRotation(Quatf::fromMat3(flipX.toMat3()), flipX));
+    check("fromMat3 handles 180 degrees about Y (y branch)",
+          sameRotation(Quatf::fromMat3(flipY.toMat3()), flipY));
+    check("fromMat3 handles 180 degrees about Z (z branch)",
+          sameRotation(Quatf::fromMat3(flipZ.toMat3()), flipZ));
+
+    // An axis-aligned flip leaves three of the four components at zero, so a
+    // branch can be wrong in a way those cases cannot see. Near-180 degrees
+    // about a skewed axis keeps every component nonzero and still selects the
+    // same branch, which is what actually pins each formula down.
+    const float NEAR_PI = 179.f * PI / 180.f;
+    Quatf skewX = Quatf::fromAxisAngle({3, 2, 1}, NEAR_PI);   // |x| largest
+    Quatf skewY = Quatf::fromAxisAngle({2, 3, 1}, NEAR_PI);   // |y| largest
+    Quatf skewZ = Quatf::fromAxisAngle({1, 2, 3}, NEAR_PI);   // |z| largest
+    check("fromMat3 handles a skewed near-180 rotation (x branch)",
+          sameRotation(Quatf::fromMat3(skewX.toMat3()), skewX));
+    check("fromMat3 handles a skewed near-180 rotation (y branch)",
+          sameRotation(Quatf::fromMat3(skewY.toMat3()), skewY));
+    check("fromMat3 handles a skewed near-180 rotation (z branch)",
+          sameRotation(Quatf::fromMat3(skewZ.toMat3()), skewZ));
+
+    check("fromMat3 returns a unit quaternion",
+          isEqual(Quatf::fromMat3(skewX.toMat3()).norm(), 1.f));
+
+    // the other direction: matrix -> quat -> matrix must be a no-op
+    Mat3f m = q.toMat3();
+    check("toMat3(fromMat3(m)) == m", isEqual(Quatf::fromMat3(m).toMat3(), m));
+
+    // sweep a range of axes and angles so no branch goes unvisited
+    check("fromMat3 round-trips across a sweep of rotations", [] {
+        const Vec3f axes[] = {
+            {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, 0, 1},
+            {0, 1, 1}, {1, 1, 1}, {3, 2, 1}, {1, 2, 3}, {-2, 1, -0.5f}
+        };
+        for (const Vec3f& axis : axes) {
+            for (int deg = -180; deg <= 180; deg += 5) {
+                Quatf r = Quatf::fromAxisAngle(axis, deg * PI / 180.f);
+                if (!sameRotation(Quatf::fromMat3(r.toMat3()), r)) return false;
+            }
+        }
+        return true;
+    }());
+
+    // the interpolate-between-two-rotation-matrices path this exists for
+    check("slerp between two matrices stays a rotation", [] {
+        Mat3f a = Quatf::fromAxisAngle({0, 1, 0}, 0.f).toMat3();
+        Mat3f b = Quatf::fromAxisAngle({0.3f, 1, 0.2f}, 150.f * PI / 180.f).toMat3();
+        Quatf qa = Quatf::fromMat3(a);
+        Quatf qb = Quatf::fromMat3(b);
+        for (int i = 0; i <= 10; ++i) {
+            Mat3f m = math::slerp(qa, qb, i / 10.f).toMat3();
+            if (!isEqual(m.determinant(), 1.f)) return false;
+            if (!isEqual(m.transpose(), m.inverse())) return false;
+        }
+        return true;
+    }());
+    check("slerp between two matrices hits its endpoints", [] {
+        Mat3f a = Quatf::fromAxisAngle({1, 0, 0}, 0.4f).toMat3();
+        Mat3f b = Quatf::fromAxisAngle({0, 0, 1}, 1.9f).toMat3();
+        Quatf qa = Quatf::fromMat3(a);
+        Quatf qb = Quatf::fromMat3(b);
+        return isEqual(math::slerp(qa, qb, 0.f).toMat3(), a)
+            && isEqual(math::slerp(qa, qb, 1.f).toMat3(), b);
+    }());
+}
+
+
+/* ========================================================================= //
+    toMat4
+// ========================================================================= */
+
+static void testToMat4() {
+    section("toMat4");
+
+    check("toMat4(identity) is the identity matrix",
+          isEqual(Quatf::identity().toMat4(), Mat4f::identity()));
+
+    Quatf q = Quatf::fromAxisAngle({1, 2, 3}, 0.9f);
+    Mat4f m = q.toMat4();
+
+    check("toMat4 upper-left equals toMat3", isEqual(m.upperLeft(), q.toMat3()));
+
+    check("toMat4 last row and column are 0,0,0,1",
+          isEqual(m[0][3], 0.f) && isEqual(m[1][3], 0.f) && isEqual(m[2][3], 0.f) &&
+          isEqual(m[3][0], 0.f) && isEqual(m[3][1], 0.f) && isEqual(m[3][2], 0.f) &&
+          isEqual(m[3][3], 1.f));
+
+    // a point (w == 1) must come out rotated, with w untouched
+    Vec3f p = {0.4f, -1.3f, 2.f};
+    Vec3f expected = q.rotate(p);
+    Vec4f out = m * Vec4f{p.x, p.y, p.z, 1.f};
+    check("toMat4 rotates a point and leaves w alone",
+          isEqual(out.xyz, expected) && isEqual(out.w, 1.f));
+
+    // no translation, so a direction (w == 0) rotates the same way
+    Vec4f dir = m * Vec4f{p.x, p.y, p.z, 0.f};
+    check("toMat4 rotates a direction the same as a point",
+          isEqual(dir.xyz, expected) && isEqual(dir.w, 0.f));
+
+    check("toMat4 determinant is 1", isEqual(m.determinant(), 1.f));
+
+    check("toMat4(a*b) == toMat4(a) * toMat4(b)", [] {
+        Quatf a = Quatf::fromAxisAngle({1, 0, 0}, 0.6f);
+        Quatf b = Quatf::fromAxisAngle({-2, 1, 0.5f}, -1.1f);
+        return isEqual((a * b).toMat4(), a.toMat4() * b.toMat4());
+    }());
+
+    check("Mat4::fromMat3 agrees with toMat4",
+          isEqual(Mat4f::fromMat3(q.toMat3()), m));
+}
+
+
+/* ========================================================================= //
+    toAxisAngle
+// ========================================================================= */
+
+static void testToAxisAngle() {
+    section("toAxisAngle");
+
+    Vec3f axis;
+    float angle;
+
+    // identity has no meaningful axis, so the stand-in is returned instead
+    Quatf::identity().toAxisAngle(axis, angle);
+    check("toAxisAngle of identity gives angle 0", isEqual(angle, 0.f));
+    check("toAxisAngle of identity gives the stand-in axis", isEqual(axis, Vec3f{1, 0, 0}));
+
+    Quatf q = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
+    q.toAxisAngle(axis, angle);
+    check("toAxisAngle recovers the axis", isEqual(axis, math::normalize(Vec3f{1, 2, 3})));
+    check("toAxisAngle recovers the angle", isEqual(angle, 0.7f));
+    check("toAxisAngle returns a unit axis", isEqual(axis.magnitude(), 1.f));
+    check("toAxisAngle round-trips", sameRotation(Quatf::fromAxisAngle(axis, angle), q));
+
+    // w == 0 here, the case acos-based formulations get wrong
+    Quatf flip = Quatf::fromAxisAngle({0, 1, 0}, PI);
+    flip.toAxisAngle(axis, angle);
+    check("toAxisAngle of a 180 degree rotation gives PI", isEqual(angle, PI));
+    check("toAxisAngle of a 180 degree rotation keeps the axis",
+          isEqual(axis, Vec3f{0, 1, 0}));
+
+    /*
+        Small angles need a RELATIVE tolerance. isEqual is absolute at 1e-4, so
+        comparing a 1e-5 angle against 1e-5 passes even if the function returns
+        zero -- which is exactly the failure an acos(w) formulation produces.
+    */
+    const float SMALL = 1e-5f;
+    Quatf tiny = Quatf::fromAxisAngle({0, 0, 1}, SMALL);
+    tiny.toAxisAngle(axis, angle);
+    check("toAxisAngle keeps precision at a small angle",
+          std::fabs(angle - SMALL) < SMALL * 0.01f);
+    check("toAxisAngle keeps the axis at a small angle", isEqual(axis, Vec3f{0, 0, 1}));
+
+    // below the epsilon guard the axis is noise, so the stand-in takes over
+    Quatf tinier = Quatf::fromAxisAngle({0, 0, 1}, 1e-9f);
+    tinier.toAxisAngle(axis, angle);
+    check("toAxisAngle below the epsilon guard gives angle 0", isEqual(angle, 0.f));
+    check("toAxisAngle below the epsilon guard gives the stand-in axis",
+          isEqual(axis, Vec3f{1, 0, 0}));
+
+    // an exactly-zero vector part would be 0/0 without the guard
+    Quatf zeroV = {{0, 0, 0}, 1.f};
+    zeroV.toAxisAngle(axis, angle);
+    check("toAxisAngle never returns NaN",
+          std::isfinite(angle) && std::isfinite(axis.x) &&
+          std::isfinite(axis.y) && std::isfinite(axis.z));
+
+    /*
+        atan2(k*len, k*w) == atan2(len, w) and the axis divides by its own
+        magnitude, so neither result depends on the quaternion being unit.
+    */
+    Quatf scaled = q * 3.f;
+    Vec3f sAxis; float sAngle;
+    scaled.toAxisAngle(sAxis, sAngle);
+    check("toAxisAngle is scale-invariant",
+          isEqual(sAxis, math::normalize(Vec3f{1, 2, 3})) && isEqual(sAngle, 0.7f));
+
+    // the range is [0, 2PI]: -q describes the same rotation the long way round
+    Quatf neg = -q;
+    neg.toAxisAngle(axis, angle);
+    check("toAxisAngle of -q is the same rotation",
+          sameRotation(Quatf::fromAxisAngle(axis, angle), q));
+    check("toAxisAngle stays within [0, 2PI]", [] {
+        for (int deg = -360; deg <= 360; deg += 7) {
+            Quatf r = Quatf::fromAxisAngle({1, -2, 0.5f}, deg * PI / 180.f);
+            Vec3f a; float t;
+            r.toAxisAngle(a, t);
+            if (t < 0.f || t > 2.f * PI + 1e-4f) return false;
+        }
+        return true;
+    }());
+
+    check("toAxisAngle round-trips across a sweep of rotations", [] {
+        const Vec3f axes[] = {
+            {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, 1, 1}, {3, 2, 1}, {-2, 1, -0.5f}
+        };
+        for (const Vec3f& ax : axes) {
+            for (int deg = -180; deg <= 180; deg += 5) {
+                Quatf r = Quatf::fromAxisAngle(ax, deg * PI / 180.f);
+                Vec3f a; float t;
+                r.toAxisAngle(a, t);
+                if (!sameRotation(Quatf::fromAxisAngle(a, t), r)) return false;
+                if (!isEqual(a.magnitude(), 1.f)) return false;
+            }
+        }
+        return true;
+    }());
+}
+
+
+/* ========================================================================= //
+    operator== / operator!=
+// ========================================================================= */
+
+static void testEquality() {
+    section("operator== / operator!=");
+
+    Quatf q     = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
+    Quatf same  = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
+    Quatf other = Quatf::fromAxisAngle({1, 2, 3}, 0.8f);
+
+    check("q == q", q == q);
+    check("q == an identically built quaternion", q == same);
+    check("q != a different quaternion", q != other);
+    check("operator!= is the negation of operator==", (q != same) == !(q == same));
+    check("identity() == identity()", Quatf::identity() == Quatf::identity());
+
+    /*
+        Comparison is COMPONENT-WISE, not rotational: q and -q are the same
+        rotation but compare unequal. sameRotation() is the helper to use when
+        the rotation is what matters.
+    */
+    check("q != -q (comparison is component-wise, not rotational)", q != -q);
+    check("q and -q are still the same rotation", sameRotation(q, -q));
+
+    // both operators are const, so they work on const objects and temporaries
+    const Quatf cq = q;
+    const Quatf cSame = same;
+    check("operator== works on const quaternions", cq == cSame);
+    check("operator!= works on const quaternions", !(cq != cSame));
+
+    // exact float comparison: a value that differs by one ulp is not equal
+    Quatf nudged = q;
+    nudged.w = std::nextafter(q.w, 2.f);
+    check("operator== is exact, not tolerant", q != nudged);
+}
+
+
+/* ========================================================================= //
+    normalize (free function, matching Vec)
+// ========================================================================= */
+
+static void testNormalize() {
+    section("normalize");
+
+    Quatf unit = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
+    Quatf big  = unit * 5.f;
+
+    check("normalize returns a unit quaternion", isEqual(math::normalize(big).norm(), 1.f));
+    check("normalize preserves the rotation", sameRotation(math::normalize(big), unit));
+    check("normalize of a unit quaternion is a no-op",
+          isEqual(math::normalize(unit), unit));
+
+    // the whole reason for a free function: the member version mutates
+    Quatf original = big;
+    Quatf result = math::normalize(big);
+    check("normalize leaves its argument alone", big == original);
+    check("normalize returns the normalized value", isEqual(result.norm(), 1.f));
+
+    // member normalize() mutates in place and must agree with the free version
+    Quatf mutated = big;
+    mutated.normalize();
+    check("member normalize() agrees with the free normalize()",
+          isEqual(mutated, math::normalize(original)));
+    check("member normalize() mutates in place", isEqual(mutated.norm(), 1.f));
+
+    // usable in an expression on a const quaternion, which the member cannot be
+    const Quatf cbig = big;
+    check("normalize works on a const quaternion", isEqual(math::normalize(cbig).norm(), 1.f));
+
+    check("normalize of a small quaternion still gives unit length",
+          isEqual(math::normalize(unit * 1e-6f).norm(), 1.f));
+}
+
+
 int main() {
     testConstruction();
     testNormAndInverse();
     testArithmetic();
     testRotation();
     testToMat3();
+    testFromMat3();
+    testToMat4();
+    testToAxisAngle();
+    testEquality();
+    testNormalize();
     testSlerp();
 
     std::cout << "\n"
@@ -296,49 +615,6 @@ int main() {
         NOT YET IMPLEMENTED
 
         Uncomment each block as the corresponding piece is added.
-
-        --- fromMat3 (matrix -> quaternion) -------------------------------
-        Use Shepperd's method: pick whichever of the four diagonal cases has
-        the largest magnitude. The naive sqrt(1 + trace) form divides by
-        something near zero for 180-degree rotations and produces NaN.
-
-            Quatf q = Quatf::fromAxisAngle({1, 2, 3}, 0.7f);
-            check("fromMat3 round-trips", sameRotation(Quatf::fromMat3(q.toMat3()), q));
-            check("fromMat3(identity) is identity",
-                  sameRotation(Quatf::fromMat3(Mat3f::identity()), Quatf::identity()));
-            // the case the naive formula fails on:
-            Quatf flip = Quatf::fromAxisAngle({0, 1, 0}, PI);
-            check("fromMat3 handles a 180 degree rotation",
-                  sameRotation(Quatf::fromMat3(flip.toMat3()), flip));
-
-        --- toMat4 --------------------------------------------------------
-        The 3x3 rotation in the upper-left, 1 in the bottom-right corner.
-
-            check("toMat4 upper-left equals toMat3", ...);
-            check("toMat4 last row/column is 0,0,0,1", ...);
-
-        --- toAxisAngle ---------------------------------------------------
-        Inverse of fromAxisAngle. Watch the near-identity case, where the
-        axis is undefined and sin(theta/2) approaches zero.
-
-            Vec3f axis; float angle;
-            q.toAxisAngle(axis, angle);
-            check("toAxisAngle round-trips", sameRotation(Quatf::fromAxisAngle(axis, angle), q));
-            check("toAxisAngle of identity gives angle 0", ...);
-
-        --- operator== / operator!= ---------------------------------------
-        Decide whether q and -q compare equal, since they are the same
-        rotation, and say which in a comment. Both answers are defensible.
-
-            check("q == q", ...);
-            check("q != other", ...);
-
-        --- normalized() const --------------------------------------------
-        normalize() mutates; a const version returning a copy is needed for
-        expressions. fromAxisAngle currently needs the axis by value only
-        because Vec3 lacks the same thing.
-
-            check("normalized() leaves the original alone", ...);
 
         --- nlerp ---------------------------------------------------------
         Cheaper than slerp, non-constant angular velocity. Currently only

@@ -11,7 +11,9 @@
 
 namespace math {
 
-// !!! All matrices are ROW-MAJOR !!!
+// ========================================================================= //
+//                  !!! All matrices are ROW-MAJOR !!!                       //
+// ========================================================================= //
 
 /* ========================================================================= //
     Mat2
@@ -226,6 +228,14 @@ template <typename T> struct Mat4 {
     const T* data() const { return &rows[0][0]; }
 
     static Mat4 identity() { return { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }; }
+    static Mat4 fromMat3(const Mat3<T>& m) {
+        return {
+            m[0][0], m[0][1], m[0][2], T(0),
+            m[1][0], m[1][1], m[1][2], T(0),
+            m[2][0], m[2][1], m[2][2], T(0),
+            T(0),    T(0),    T(0),    T(1)
+        };
+    }
 
     Mat4 transpose() const {
         Mat4 res;
@@ -309,6 +319,8 @@ template <typename T> struct Mat4 {
             D, H, L, P
         } / det;
     }
+
+    Mat3<T> upperLeft() const { return { rows[0].xyz, rows[1].xyz, rows[2].xyz }; }
 
     Vec4<T>& operator[](int i) { return rows[i]; }
     const Vec4<T>& operator[](int i) const { return rows[i]; }
