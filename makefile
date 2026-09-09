@@ -1,4 +1,10 @@
-all: debug-demo release-demo rdbi-demo debug-time release-time rdbi-time
+all: release-quat release-tensor release-json release-gpt2 release-gpt2demo
+
+test: release-quat release-tensor release-json release-gpt2
+	./bin/release/quat-testing
+	./bin/release/tensor-testing
+	./bin/release/json-testing
+	./bin/release/gpt2-testing
 
 debug-demo:
 	clear
@@ -106,3 +112,69 @@ rdbi-quat:
 	mkdir -p bin/rdbi
 	echo "building quaternion tests rdbi..."
 	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/quat-testing src/quat-testing.cpp -Werror -Wall
+
+debug-tensor:
+	clear
+	mkdir -p bin/debug
+	echo "building tensor tests debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/tensor-testing src/tensor-testing.cpp -Werror -Wall
+
+release-tensor:
+	clear
+	mkdir -p bin/release
+	echo "building tensor tests release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/tensor-testing src/tensor-testing.cpp -Werror -Wall
+
+rdbi-tensor:
+	clear
+	mkdir -p bin/rdbi
+	echo "building tensor tests rdbi..."
+	g++ -std=c++26 -Isrc -Iinclude -O2 -g -o bin/rdbi/tensor-testing src/tensor-testing.cpp -Werror -Wall
+
+debug-json:
+	clear
+	mkdir -p bin/debug
+	echo "building json debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/json-testing src/json-testing.cpp -Werror -Wall
+
+release-json:
+	clear
+	mkdir -p bin/release
+	echo "building json release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/json-testing src/json-testing.cpp -Werror -Wall
+
+debug-safetensors:
+	clear
+	mkdir -p bin/debug
+	echo "building safetensors debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/safetensors-testing src/safetensors-testing.cpp -Werror -Wall
+
+release-safetensors:
+	clear
+	mkdir -p bin/release
+	echo "building safetensors release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/safetensors-testing src/safetensors-testing.cpp -Werror -Wall
+
+debug-gpt2:
+	clear
+	mkdir -p bin/debug
+	echo "building gpt2 debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/gpt2-testing src/gpt2-testing.cpp -Werror -Wall
+
+release-gpt2:
+	clear
+	mkdir -p bin/release
+	echo "building gpt2 release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpt2-testing src/gpt2-testing.cpp -Werror -Wall
+
+debug-gpt2demo:
+	clear
+	mkdir -p bin/debug
+	echo "building gpt2 demo debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/gpt2 src/gpt2.cpp -Werror -Wall
+
+release-gpt2demo:
+	clear
+	mkdir -p bin/release
+	echo "building gpt2 demo release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpt2 src/gpt2.cpp -Werror -Wall
