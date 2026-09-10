@@ -246,7 +246,9 @@ int main(int argc, char** argv) {
           tokens rather than reprocessing the conversation
     */
     const auto run = [&](const std::string& text) {
-        std::vector<size_t> ids = model.tokenizer.encode(text);
+        /* the wrapper tokens belong to the start of a sequence, so a
+           follow-up turn appended to a live cache must not repeat them */
+        std::vector<size_t> ids = model.tokenizer.encode(text, cache.length == 0);
         if (ids.empty()) return;
 
         if (cache.length + ids.size() + 8 >= context) {

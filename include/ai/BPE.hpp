@@ -108,6 +108,16 @@ struct Tokenizer {
 
     PreTokenizer                             style = PreTokenizer::GPT2;
 
+    /*
+        Tokens the file's post_processor wraps every sequence in - in
+        practice a BOS marker, and for some models a trailing one too.
+        These are NOT optional decoration. Mistral-Small-24B without its
+        <s> emits nothing but whitespace; the 7B tolerates the omission,
+        which is exactly the kind of difference that makes hardcoding per
+        model a trap.
+    */
+    std::vector<size_t>                      prefixIds, suffixIds;
+
     /* Metaspace only: U+2581 as UTF-8, and whether a leading one is added */
     std::string                              metaspaceMark = "\xe2\x96\x81";
     bool                                     prependMark = true;
@@ -216,6 +226,8 @@ struct Tokenizer {
         buildByteMap();
         style = PreTokenizer::Qwen;
 
+        std::vector<std::string> prefixNames, suffixNames;
+
         const files::json::ParseResult parsed = files::json::parseFile(tokenizerPath);
         if (!parsed.ok) { error = "tokenizer.json: " + parsed.error; return false; }
 
@@ -244,6 +256,30 @@ struct Tokenizer {
         }
         byteFallback = model["byte_fallback"].asBool(false);
 
+        /*
+            post_processor says what wraps a sequence. TemplateProcessing's
+            "single" is a list of SpecialToken and Sequence entries; anything
+            before the Sequence is a prefix, anything after is a suffix
+        */
+        const files::json::Value& post = parsed.value["post_processor"];
+        if (post["type"].asString() == "TemplateProcessing") {
+            const files::json::Value& single = post["single"];
+            bool seenSequence = false;
+
+            for (size_t i = 0; i < single.size(); ++i) {
+                const files::json::Value& item = single[i];
+
+                if (item.contains("Sequence")) { seenSequence = true; continue; }
+                if (!item.contains("SpecialToken")) continue;
+
+                const std::string name = item["SpecialToken"]["id"].asString();
+                if (name.empty()) continue;
+
+                // resolved after added_tokens are read, below
+                (seenSequence ? suffixNames : prefixNames).push_back(name);
+            }
+        }
+
         const files::json::Value& merges = model["merges"];
         if (!merges.isArray()) { error = "tokenizer.json: no model.merges"; return false; }
 
@@ -264,6 +300,12 @@ struct Tokenizer {
             specialById[id] = content;
             if (id >= decoder.size()) decoder.resize(id + 1);
         }
+
+        // resolve the wrapper names now that added_tokens have been read
+        for (const std::string& n : prefixNames)
+            if (hasSpecial(n)) prefixIds.push_back(idFor(n));
+        for (const std::string& n : suffixNames)
+            if (hasSpecial(n)) suffixIds.push_back(idFor(n));
 
         return !encoder.empty() && !ranks.empty();
     }
@@ -499,9 +541,29 @@ struct Tokenizer {
           between them encoded normally, so a chat template's <|im_start|>
           survives rather than being merged into what surrounds it
     */
-    std::vector<size_t> encode(std::string_view text) const {
+    /*
+        encode(text, addSpecials):
+        - addSpecials wraps the result in whatever the file's post_processor
+          declares, which is what HuggingFace does by default. It must be
+          false for anything continuing an existing sequence - a second
+          conversation turn appended to a KV cache already has its BOS
+    */
+    std::vector<size_t> encode(std::string_view text, bool addSpecials = true) const {
         std::vector<size_t> ids;
 
+        if (addSpecials)
+            ids.insert(ids.end(), prefixIds.begin(), prefixIds.end());
+
+        encodeBody(text, ids);
+
+        if (addSpecials)
+            ids.insert(ids.end(), suffixIds.begin(), suffixIds.end());
+
+        return ids;
+    }
+
+
+    void encodeBody(std::string_view text, std::vector<size_t>& ids) const {
         if (!specials.empty()) {
             size_t cursor = 0;
             while (cursor < text.size()) {
@@ -520,11 +582,10 @@ struct Tokenizer {
             }
 
             if (cursor < text.size()) encodePlain(text.substr(cursor), ids);
-            return ids;
+            return;
         }
 
         encodePlain(text, ids);
-        return ids;
     }
 
 
