@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -29,6 +30,14 @@
 namespace ai {
 
 namespace fs = std::filesystem;
+
+/*
+    LoadProgress:
+    - called with the bytes read so far, the total expected, and what is
+      currently being read. Reading tens of gigabytes takes long enough that
+      silence is indistinguishable from a hang
+*/
+using LoadProgress = std::function<void(size_t done, size_t total, const std::string& stage)>;
 
 
 /* ========================================================================= //
@@ -68,7 +77,8 @@ struct Safetensors {
     std::string                                  error;
 
 
-    bool load(const fs::path& path) {
+    bool load(const fs::path& path, const LoadProgress& onProgress = {},
+              size_t baseDone = 0, size_t grandTotal = 0) {
         error.clear();
         entries.clear();
         blob.reset();
@@ -79,7 +89,24 @@ struct Safetensors {
             return false;
         }
 
-        blob = std::make_shared<std::string>(file.text());
+        const std::string label = path.filename().string();
+
+        /*
+            bad_alloc rather than a crash. A model larger than memory fails
+            here, at a named allocation of a known size, which is a far more
+            useful place to find out than std::terminate with no message
+        */
+        try {
+            blob = std::make_shared<std::string>(
+                file.text([&](size_t done, size_t total) {
+                    if (onProgress)
+                        onProgress(baseDone + done, grandTotal ? grandTotal : total, label);
+                }));
+        } catch (const std::bad_alloc&) {
+            error = label + ": out of memory reading "
+                  + std::to_string(file.size() / (1024 * 1024)) + " MB";
+            return false;
+        }
         if (blob->size() < 8) {
             error = "file is too small to hold a header length";
             return false;
@@ -258,6 +285,37 @@ struct Safetensors {
 
 
     /*
+        rawBF16(name):
+        - a bfloat16 tensor as a view over the file bytes, with no conversion
+          and no copy. The kernels widen each value as they read it.
+        - returns empty for anything not stored as BF16, so the caller falls
+          back to the widening path rather than reinterpreting the wrong bits
+    */
+    Tensor<uint16_t> rawBF16(const std::string& name) const {
+        const TensorInfo* meta = info(name);
+        if (!meta || !blob || meta->dtype != "BF16") return Tensor<uint16_t>();
+
+        const uint8_t* base =
+            reinterpret_cast<const uint8_t*>(blob->data()) + payloadBegin + meta->begin;
+
+        Tensor<uint16_t> out;
+        out.shape   = meta->shape;
+        out.strides = Tensor<uint16_t>::defaultStrides(out.shape);
+
+        if (reinterpret_cast<uintptr_t>(base) % alignof(uint16_t) == 0) {
+            uint16_t* typed = reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(base));
+            out.storage = std::shared_ptr<uint16_t[]>(blob, typed);
+            out.ptr     = typed;
+            return out;
+        }
+
+        Tensor<uint16_t> copy(meta->shape);
+        std::memcpy(copy.ptr, base, meta->byteCount());
+        return copy;
+    }
+
+
+    /*
         halfToFloat(half):
         - IEEE 754 binary16 to binary32. The exponent bias changes from 15 to
           127, and the two edge cases have to be handled separately: an
@@ -291,6 +349,216 @@ struct Safetensors {
         float out = 0.0f;
         std::memcpy(&out, &bits, 4);
         return out;
+    }
+};
+
+
+
+/* ========================================================================= //
+    ModelWeights
+
+    A model past a couple of gigabytes is split across numbered shards, with
+    a model.safetensors.index.json naming which shard holds each tensor. This
+    presents the whole set as one lookup so nothing above it has to care
+    whether the checkpoint arrived as one file or eighteen.
+// ========================================================================= */
+
+struct ModelWeights {
+    std::vector<Safetensors>                    shards;
+    std::vector<std::pair<std::string, size_t>> where;      // tensor -> shard
+
+    /*
+        Every tensor, already widened to float. Materialising up front and
+        dropping each shard's raw bytes as soon as it has been converted is
+        what keeps peak memory near the size of the finished weights rather
+        than the size of the weights PLUS the whole file: a bf16 checkpoint
+        doubles when widened, so holding both at once costs 50% more than
+        necessary and is the difference between an 8B model fitting and not.
+    */
+    std::vector<std::pair<std::string, Tensor<float>>> tensors;
+
+    /*
+        When widen is false the file bytes are kept and nothing is converted:
+        a bfloat16 weight is handed out as a Tensor<uint16_t> aliasing the
+        blob, and the kernels widen it as they read. Resident memory is then
+        the size of the file rather than twice it, and loading is just the
+        read - no per-tensor pass at all.
+    */
+    bool                                        widen = true;
+    std::vector<std::pair<std::string, Tensor<uint16_t>>> raw;
+    std::string                                 error;
+
+    bool load(const fs::path& directory, bool widenToFloat = true,
+              const LoadProgress& onProgress = {}) {
+        error.clear();
+        shards.clear();
+        where.clear();
+        tensors.clear();
+        raw.clear();
+        widen = widenToFloat;
+
+        const fs::path index = directory / "model.safetensors.index.json";
+        std::vector<std::string> files;
+
+        if (fs::exists(index)) {
+            const files::json::ParseResult parsed = files::json::parseFile(index);
+            if (!parsed.ok) { error = "index: " + parsed.error; return false; }
+
+            const files::json::Value& map = parsed.value["weight_map"];
+            if (!map.isObject()) { error = "index: no weight_map"; return false; }
+
+            // the map repeats a shard name once per tensor; collect uniques
+            for (const files::json::Member& m : map.object) {
+                const std::string file = m.second.asString();
+                bool seen = false;
+                for (const std::string& f : files) if (f == file) { seen = true; break; }
+                if (!seen) files.push_back(file);
+            }
+        } else if (fs::exists(directory / "model.safetensors")) {
+            files.push_back("model.safetensors");
+        } else {
+            error = "no model.safetensors or index in " + directory.string();
+            return false;
+        }
+
+        // total up front so the caller can show one bar across every shard
+        size_t grandTotal = 0;
+        for (const std::string& f : files) {
+            std::error_code ec;
+            grandTotal += static_cast<size_t>(fs::file_size(directory / f, ec));
+        }
+
+        shards.resize(files.size());
+        size_t done = 0;
+
+        for (size_t i = 0; i < files.size(); ++i) {
+            std::error_code ec;
+            const size_t shardBytes = static_cast<size_t>(fs::file_size(directory / files[i], ec));
+
+            if (!shards[i].load(directory / files[i], onProgress, done, grandTotal)) {
+                error = files[i] + ": " + shards[i].error;
+                return false;
+            }
+            done += shardBytes;
+
+            for (const auto& e : shards[i].entries) {
+                where.emplace_back(e.first, i);
+                if (widen) tensors.emplace_back(e.first, shards[i].tensor(e.first));
+                else       raw.emplace_back(e.first, shards[i].rawBF16(e.first));
+            }
+
+            /*
+                When widening, release this shard's raw bytes before reading
+                the next one: every tensor now owns its own memory, so the
+                file bytes are genuinely freed and peak stays near the size of
+                the finished weights rather than the sum of both.
+
+                When NOT widening the blob has to stay: the bfloat16 views
+                alias it, and the small tensors that are still converted on
+                demand read from it too.
+            */
+            if (widen) shards[i].blob.reset();
+        }
+
+        return !where.empty();
+    }
+
+    size_t shardCount() const { return shards.size(); }
+    size_t count() const { return where.size(); }
+
+    bool contains(const std::string& name) const {
+        for (const auto& w : where) if (w.first == name) return true;
+        return false;
+    }
+
+    std::vector<std::string> names() const {
+        std::vector<std::string> out;
+        out.reserve(where.size());
+        for (const auto& w : where) out.push_back(w.first);
+        return out;
+    }
+
+    Tensor<float> tensor(const std::string& name) const {
+        for (const auto& t : tensors) if (t.first == name) return t.second;
+
+        // not widened at load time, so convert this one on demand
+        for (const auto& w : where)
+            if (w.first == name) return shards[w.second].tensor(name);
+        return Tensor<float>();
+    }
+
+    Tensor<uint16_t> rawBF16(const std::string& name) const {
+        for (const auto& t : raw) if (t.first == name) return t.second;
+        return Tensor<uint16_t>();
+    }
+
+    const TensorInfo* info(const std::string& name) const {
+        for (const auto& w : where) {
+            const TensorInfo* i = shards[w.second].info(name);
+            if (w.first == name && i) return i;
+        }
+        return nullptr;
+    }
+
+    /*
+        Both counts come from the header rather than from whichever list
+        happens to be populated. An F32 checkpoint loaded with widen=false
+        fills neither: its tensors are handed out as aliasing views on
+        demand, so counting the lists would report zero for a model that is
+        very much resident.
+    */
+    size_t parameterCount() const {
+        size_t total = 0;
+        for (const auto& w : where) {
+            const TensorInfo* i = shards[w.second].info(w.first);
+            if (i) total += i->numel();
+        }
+        return total;
+    }
+
+    /* the weights actually resident, which is what matters, not the file
+       size on disk */
+    size_t residentBytes() const {
+        size_t total = 0;
+        for (const auto& w : where) {
+            const TensorInfo* i = shards[w.second].info(w.first);
+            if (!i) continue;
+            // widened at load, or kept in whatever width the file used
+            total += widen ? i->numel() * sizeof(float) : i->byteCount();
+        }
+        return total;
+    }
+
+    /* the bytes on disk, which is what has to be read and, for a bfloat16
+       checkpoint kept as-is, roughly what ends up resident */
+    static size_t weightBytesOnDisk(const fs::path& directory) {
+        std::error_code ec;
+        size_t total = 0;
+
+        const fs::path index = directory / "model.safetensors.index.json";
+        if (fs::exists(index, ec)) {
+            const files::json::ParseResult parsed = files::json::parseFile(index);
+            const files::json::Value& map = parsed.value["weight_map"];
+
+            std::vector<std::string> seen;
+            for (const files::json::Member& m : map.object) {
+                const std::string file = m.second.asString();
+                bool already = false;
+                for (const std::string& f : seen) if (f == file) { already = true; break; }
+                if (already) continue;
+                seen.push_back(file);
+                total += static_cast<size_t>(fs::file_size(directory / file, ec));
+            }
+            return total;
+        }
+
+        return static_cast<size_t>(fs::file_size(directory / "model.safetensors", ec));
+    }
+
+    size_t byteSize() const {
+        size_t total = 0;
+        for (const Safetensors& s : shards) total += s.blob ? s.blob->size() : 0;
+        return total;
     }
 };
 

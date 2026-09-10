@@ -76,10 +76,47 @@ inline uint32_t utf8Next(std::string_view s, size_t& i) {
     Tokenizer
 // ========================================================================= */
 
+/*
+    Which pre-tokenisation rule set to apply. Both models use the same
+    byte-level alphabet and the same merge algorithm; they differ only in how
+    the text is chopped up before merging, and that difference changes every
+    id produced.
+*/
+/*
+    Two entirely different alphabets, not just two splitting rules.
+
+    GPT2 and Qwen are BYTE LEVEL: the raw bytes are mapped into a private
+    printable alphabet and the vocabulary is written in that alphabet, which
+    is why it is full of characters like the one standing in for a space.
+
+    Metaspace is what SentencePiece-derived tokenizers use - Mistral, Llama-2,
+    and most things predating the byte-level convention. The vocabulary holds
+    ordinary UTF-8, a space is written as U+2581, and any character missing
+    from the vocabulary falls back to one <0xNN> token per byte.
+
+    Decoding one with the other's rules does not fail loudly. It drops every
+    space and mangles the prompt, and the model answers a question nobody
+    asked.
+*/
+enum class PreTokenizer { GPT2, Qwen, Metaspace };
+
+
 struct Tokenizer {
     std::unordered_map<std::string, int32_t> encoder;   // mapped string -> id
     std::vector<std::string>                 decoder;   // id -> mapped string
     std::unordered_map<std::string, int32_t> ranks;     // "left right" -> priority
+
+    PreTokenizer                             style = PreTokenizer::GPT2;
+
+    /* Metaspace only: U+2581 as UTF-8, and whether a leading one is added */
+    std::string                              metaspaceMark = "\xe2\x96\x81";
+    bool                                     prependMark = true;
+    bool                                     byteFallback = false;
+
+    /* added_tokens live outside the BPE vocabulary and are matched as literal
+       text before any splitting, so <|im_start|> stays a single token */
+    std::vector<std::pair<std::string, size_t>> specials;
+    std::unordered_map<size_t, std::string>     specialById;
 
     std::string byteToUnicode[256];                     // UTF-8 of the stand-in
     std::unordered_map<std::string, uint8_t> unicodeToByte;
@@ -168,7 +205,87 @@ struct Tokenizer {
     }
 
 
+    /*
+        loadJson(tokenizer.json):
+        - the HuggingFace single-file tokenizer. model.vocab is the same
+          mapped-string to id table vocab.json holds, and model.merges the
+          same rule list merges.txt holds, only as pairs rather than lines
+    */
+    bool loadJson(const fs::path& tokenizerPath) {
+        error.clear();
+        buildByteMap();
+        style = PreTokenizer::Qwen;
+
+        const files::json::ParseResult parsed = files::json::parseFile(tokenizerPath);
+        if (!parsed.ok) { error = "tokenizer.json: " + parsed.error; return false; }
+
+        const files::json::Value& model = parsed.value["model"];
+        const files::json::Value& vocab = model["vocab"];
+        if (!vocab.isObject()) { error = "tokenizer.json: no model.vocab"; return false; }
+
+        decoder.assign(vocab.size(), std::string());
+        for (const files::json::Member& m : vocab.object) {
+            const int32_t id = static_cast<int32_t>(m.second.asInt(-1));
+            if (id < 0) continue;
+            encoder[m.first] = id;
+            if (static_cast<size_t>(id) >= decoder.size()) decoder.resize(static_cast<size_t>(id) + 1);
+            decoder[static_cast<size_t>(id)] = m.first;
+        }
+
+        /*
+            which alphabet this vocabulary is written in. Getting it wrong is
+            silent: every space disappears and the ids are meaningless
+        */
+        const files::json::Value& pre = parsed.value["pre_tokenizer"];
+        if (pre["type"].asString() == "Metaspace") {
+            style = PreTokenizer::Metaspace;
+            if (pre["replacement"].isString()) metaspaceMark = pre["replacement"].asString();
+            prependMark = pre["prepend_scheme"].asString("first") != "never";
+        }
+        byteFallback = model["byte_fallback"].asBool(false);
+
+        const files::json::Value& merges = model["merges"];
+        if (!merges.isArray()) { error = "tokenizer.json: no model.merges"; return false; }
+
+        for (size_t i = 0; i < merges.size(); ++i) {
+            const files::json::Value& m = merges[i];
+            if (m.isArray() && m.size() == 2)
+                ranks[m[0].asString() + " " + m[1].asString()] = static_cast<int32_t>(i);
+            else if (m.isString())
+                ranks[m.asString()] = static_cast<int32_t>(i);
+        }
+
+        const files::json::Value& added = parsed.value["added_tokens"];
+        for (size_t i = 0; i < added.size(); ++i) {
+            const std::string content = added[i]["content"].asString();
+            const size_t id = added[i]["id"].asSize();
+            if (content.empty()) continue;
+            specials.emplace_back(content, id);
+            specialById[id] = content;
+            if (id >= decoder.size()) decoder.resize(id + 1);
+        }
+
+        return !encoder.empty() && !ranks.empty();
+    }
+
+
     size_t vocabSize() const { return decoder.size(); }
+
+    size_t idFor(const std::string& special) const {
+        for (const auto& s : specials) if (s.first == special) return s.second;
+        return 0;
+    }
+
+    /*
+        hasSpecial(name):
+        - separate from idFor because id 0 is a real token in some
+          vocabularies - Mistral puts <unk> there - so "returned 0" cannot
+          double as "not present"
+    */
+    bool hasSpecial(const std::string& name) const {
+        for (const auto& s : specials) if (s.first == name) return true;
+        return false;
+    }
 
 
     /* ===================================================================== //
@@ -184,7 +301,84 @@ struct Tokenizer {
     static bool isDigit(char c)  { return c >= '0' && c <= '9'; }
     static bool isSpace(char c)  { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
 
-    static std::vector<std::string> preTokenize(std::string_view text) {
+    /*
+        preTokenizeQwen(text):
+        - the ASCII equivalent of Qwen's alternation, applied in the same
+          order because the order decides which rule wins.
+        - two differences from GPT-2 matter. Contractions match case
+          insensitively, and DIGITS ARE SPLIT ONE AT A TIME rather than in
+          runs, so 1234 becomes four tokens. The prefix a word may absorb is
+          also any non-letter non-digit, not only a space
+    */
+    static std::vector<std::string> preTokenizeQwen(std::string_view text) {
+        static const char* CONTRACTIONS[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
+
+        auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
+        auto isBreak = [](char c) { return c == '\r' || c == '\n'; };
+
+        std::vector<std::string> out;
+        size_t i = 0;
+
+        while (i < text.size()) {
+            bool matched = false;
+
+            for (const char* c : CONTRACTIONS) {
+                const size_t n = std::char_traits<char>::length(c);
+                if (text.size() - i < n) continue;
+                bool same = true;
+                for (size_t k = 0; k < n; ++k)
+                    if (lower(text[i + k]) != c[k]) { same = false; break; }
+                if (same) { out.emplace_back(text.substr(i, n)); i += n; matched = true; break; }
+            }
+            if (matched) continue;
+
+            // an optional single non-letter, non-digit, non-newline prefix
+            size_t j = i;
+            if (!isBreak(text[j]) && !isLetter(text[j]) && !isDigit(text[j])) ++j;
+            if (j < text.size() && isLetter(text[j])) {
+                while (j < text.size() && isLetter(text[j])) ++j;
+                out.emplace_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+
+            if (isDigit(text[i])) { out.emplace_back(text.substr(i, 1)); ++i; continue; }
+
+            j = i;
+            if (text[j] == ' ') ++j;
+            if (j < text.size() && !isSpace(text[j]) && !isLetter(text[j]) && !isDigit(text[j])) {
+                while (j < text.size() && !isSpace(text[j]) && !isLetter(text[j]) && !isDigit(text[j])) ++j;
+                while (j < text.size() && isBreak(text[j])) ++j;
+                out.emplace_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+
+            // whitespace ending in at least one line break
+            j = i;
+            while (j < text.size() && isSpace(text[j]) && !isBreak(text[j])) ++j;
+            if (j < text.size() && isBreak(text[j])) {
+                while (j < text.size() && isBreak(text[j])) ++j;
+                out.emplace_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+
+            // the trailing-whitespace rules, as in GPT-2
+            size_t k = i;
+            while (k < text.size() && isSpace(text[k])) ++k;
+            if (k == text.size()) { out.emplace_back(text.substr(i, k - i)); i = k; continue; }
+            if (k - i > 1)        { out.emplace_back(text.substr(i, k - i - 1)); i = k - 1; continue; }
+
+            out.emplace_back(text.substr(i, 1));
+            i += 1;
+        }
+
+        return out;
+    }
+
+
+    static std::vector<std::string> preTokenizeGPT2(std::string_view text) {
         static const char* CONTRACTIONS[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
 
         std::vector<std::string> out;
@@ -294,8 +488,89 @@ struct Tokenizer {
     }
 
 
+    std::vector<std::string> preTokenize(std::string_view text) const {
+        return style == PreTokenizer::Qwen ? preTokenizeQwen(text) : preTokenizeGPT2(text);
+    }
+
+
+    /*
+        encode(text):
+        - special tokens are found as literal substrings first and the text
+          between them encoded normally, so a chat template's <|im_start|>
+          survives rather than being merged into what surrounds it
+    */
     std::vector<size_t> encode(std::string_view text) const {
         std::vector<size_t> ids;
+
+        if (!specials.empty()) {
+            size_t cursor = 0;
+            while (cursor < text.size()) {
+                size_t at = std::string_view::npos;
+                size_t which = 0;
+
+                for (size_t s = 0; s < specials.size(); ++s) {
+                    const size_t found = text.find(specials[s].first, cursor);
+                    if (found < at) { at = found; which = s; }
+                }
+                if (at == std::string_view::npos) break;
+
+                if (at > cursor) encodePlain(text.substr(cursor, at - cursor), ids);
+                ids.push_back(specials[which].second);
+                cursor = at + specials[which].first.size();
+            }
+
+            if (cursor < text.size()) encodePlain(text.substr(cursor), ids);
+            return ids;
+        }
+
+        encodePlain(text, ids);
+        return ids;
+    }
+
+
+    /*
+        encodeMetaspace(text, ids):
+        - spaces become U+2581 and the whole string is fed to BPE in one
+          piece, because this pre-tokenizer has split=false. There is no byte
+          mapping: the vocabulary is plain UTF-8
+        - a piece the vocabulary does not contain is emitted as one <0xNN>
+          token per byte, which is what byte_fallback means
+    */
+    void encodeMetaspace(std::string_view text, std::vector<size_t>& ids) const {
+        /* prepend_scheme "first" adds the mark unconditionally, and the
+           decoder unconditionally strips one leading space to undo it.
+           Adding it only when the text does not already begin with a space
+           breaks that symmetry and eats a real leading space */
+        std::string marked;
+        if (prependMark) marked += metaspaceMark;
+
+        for (char c : text) {
+            if (c == ' ') marked += metaspaceMark;
+            else          marked += c;
+        }
+
+        for (const std::string& piece : bpe(marked)) {
+            auto found = encoder.find(piece);
+            if (found != encoder.end()) { ids.push_back(static_cast<size_t>(found->second)); continue; }
+
+            if (!byteFallback) continue;
+
+            static const char* HEX = "0123456789ABCDEF";
+            for (unsigned char b : piece) {
+                std::string name = "<0x";
+                name += HEX[(b >> 4) & 0xF];
+                name += HEX[b & 0xF];
+                name += '>';
+                auto byteToken = encoder.find(name);
+                if (byteToken != encoder.end())
+                    ids.push_back(static_cast<size_t>(byteToken->second));
+            }
+        }
+    }
+
+
+    void encodePlain(std::string_view text, std::vector<size_t>& ids) const {
+        if (style == PreTokenizer::Metaspace) { encodeMetaspace(text, ids); return; }
 
         for (const std::string& chunk : preTokenize(text)) {
             std::string mapped;
@@ -306,16 +581,11 @@ struct Tokenizer {
                 if (found != encoder.end()) ids.push_back(static_cast<size_t>(found->second));
             }
         }
-
-        return ids;
     }
 
 
-    std::string decode(const std::vector<size_t>& ids) const {
-        std::string mapped;
-        for (size_t id : ids)
-            if (id < decoder.size()) mapped += decoder[id];
-
+    /* unmapBytes(mapped): printable stand-ins back to the raw bytes */
+    std::string unmapBytes(const std::string& mapped) const {
         std::string out;
         for (size_t i = 0; i < mapped.size(); ) {
             const size_t begin = i;
@@ -325,7 +595,86 @@ struct Tokenizer {
             auto found = unicodeToByte.find(symbol);
             if (found != unicodeToByte.end()) out += static_cast<char>(found->second);
         }
+        return out;
+    }
 
+
+    /*
+        decode(ids):
+        - a special token's text is literal rather than byte-mapped, so the
+          run of ordinary tokens before it has to be flushed first
+    */
+    /*
+        decodeMetaspace(ids):
+        - the reverse of the decoder chain the file declares: replace U+2581
+          with a space, turn <0xNN> back into a raw byte, concatenate, then
+          strip the single leading space the prepend added
+    */
+    std::string decodeMetaspace(const std::vector<size_t>& ids, bool trimLeading) const {
+        std::string out;
+
+        for (size_t id : ids) {
+            auto special = specialById.find(id);
+            if (special != specialById.end()) { out += special->second; continue; }
+            if (id >= decoder.size()) continue;
+
+            const std::string& piece = decoder[id];
+
+            // <0xNN> is one raw byte, not five characters
+            if (piece.size() == 6 && piece[0] == '<' && piece[1] == '0'
+                                  && piece[2] == 'x' && piece[5] == '>') {
+                const auto digit = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    return -1;
+                };
+                const int hi = digit(piece[3]), lo = digit(piece[4]);
+                if (hi >= 0 && lo >= 0) { out += static_cast<char>((hi << 4) | lo); continue; }
+            }
+
+            for (size_t i = 0; i < piece.size(); ) {
+                if (piece.compare(i, metaspaceMark.size(), metaspaceMark) == 0) {
+                    out += ' ';
+                    i += metaspaceMark.size();
+                } else {
+                    out += piece[i];
+                    ++i;
+                }
+            }
+        }
+
+        if (trimLeading && prependMark && !out.empty() && out[0] == ' ') out.erase(0, 1);
+        return out;
+    }
+
+
+    /*
+        decode(ids, trimLeading):
+        - trimLeading undoes the mark the Metaspace encoder prepends, and so
+          applies to a WHOLE sequence, not to a piece of one. Streaming a
+          generation token by token has to pass false after the first, or
+          every token loses its leading space and the output arrives as one
+          run-on word
+    */
+    std::string decode(const std::vector<size_t>& ids, bool trimLeading = true) const {
+        if (style == PreTokenizer::Metaspace) return decodeMetaspace(ids, trimLeading);
+
+        std::string out;
+        std::string mapped;
+
+        for (size_t id : ids) {
+            auto special = specialById.find(id);
+            if (special != specialById.end()) {
+                out += unmapBytes(mapped);
+                mapped.clear();
+                out += special->second;
+                continue;
+            }
+            if (id < decoder.size()) mapped += decoder[id];
+        }
+
+        out += unmapBytes(mapped);
         return out;
     }
 

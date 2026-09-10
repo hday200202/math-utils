@@ -1,10 +1,10 @@
-all: release-quat release-tensor release-json release-gpt2 release-gpt2demo
+all: release-quat release-tensor release-json release-llm release-llm-test
 
-test: release-quat release-tensor release-json release-gpt2
+test: release-quat release-tensor release-json release-llm-test
 	./bin/release/quat-testing
 	./bin/release/tensor-testing
 	./bin/release/json-testing
-	./bin/release/gpt2-testing
+	./bin/release/llm-testing
 
 debug-demo:
 	clear
@@ -143,38 +143,29 @@ release-json:
 	echo "building json release..."
 	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/json-testing src/json-testing.cpp -Werror -Wall
 
-debug-safetensors:
+
+
+
+
+
+
+
+
+
+debug-llm:
 	clear
 	mkdir -p bin/debug
-	echo "building safetensors debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/safetensors-testing src/safetensors-testing.cpp -Werror -Wall
+	echo "building llm debug..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp -Werror -Wall
 
-release-safetensors:
+release-llm:
 	clear
 	mkdir -p bin/release
-	echo "building safetensors release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/safetensors-testing src/safetensors-testing.cpp -Werror -Wall
+	echo "building llm release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp -Werror -Wall
 
-debug-gpt2:
-	clear
-	mkdir -p bin/debug
-	echo "building gpt2 debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/gpt2-testing src/gpt2-testing.cpp -Werror -Wall
-
-release-gpt2:
+release-llm-test:
 	clear
 	mkdir -p bin/release
-	echo "building gpt2 release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpt2-testing src/gpt2-testing.cpp -Werror -Wall
-
-debug-gpt2demo:
-	clear
-	mkdir -p bin/debug
-	echo "building gpt2 demo debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/gpt2 src/gpt2.cpp -Werror -Wall
-
-release-gpt2demo:
-	clear
-	mkdir -p bin/release
-	echo "building gpt2 demo release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpt2 src/gpt2.cpp -Werror -Wall
+	echo "building llm tests release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm-testing src/llm-testing.cpp -Werror -Wall
