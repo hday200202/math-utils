@@ -115,9 +115,9 @@ template <typename T> struct Vec4 {
         struct { T x, y, z, w; };
         Vec2<T> xy;
         Vec3<T> xyz;
-        struct { T _sx;      Vec2<T> yz;  };
-        struct { T _sx2;     Vec3<T> yzw; };
-        struct { T _sx3, _sy3; Vec2<T> zw; };
+        struct { T _sx;         Vec2<T> yz;  };
+        struct { T _sx2;        Vec3<T> yzw; };
+        struct { T _sx3, _sy3;  Vec2<T> zw;  };
     };
 
     T* data() { return &x; }

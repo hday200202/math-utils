@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <bit>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "../include/ai/LocalModel.hpp"
+
+namespace fs = std::filesystem;
 
 /* ========================================================================= //
     LocalModel test suite.
@@ -375,6 +379,481 @@ static void testQwen3(const std::string& dir, const std::string& oracleDir) {
 }
 
 
+/* ========================================================================= //
+    Quantisation
+
+    Checked against the unquantised model rather than against the numpy
+    reference: quantising deliberately changes the numbers, so the question
+    is not whether they moved but whether they moved far enough to change
+    what the model says.
+// ========================================================================= */
+
+static void testQuantRoundTrip() {
+    section("quantisation round trip");
+
+    /* a block whose values span a wide range, as a real weight row does */
+    const size_t n = ai::quant::BLOCK * 4;
+    std::vector<uint16_t> src(n);
+    std::vector<float> original(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const float v = std::sin(float(i) * 0.7f) * (1.0f + float(i % 7));
+        original[i] = std::bit_cast<float>(std::bit_cast<uint32_t>(v) & 0xFFFF0000u);
+        src[i] = static_cast<uint16_t>(std::bit_cast<uint32_t>(original[i]) >> 16);
+    }
+
+    for (ai::quant::Type t : {ai::quant::Type::Q8, ai::quant::Type::Q4}) {
+        ai::quant::QuantTensor q = ai::quant::quantize(src.data(), 1, n, t);
+        check(std::string(ai::quant::typeName(t)) + " quantises", q.valid());
+
+        std::vector<float> back(n);
+        ai::quant::dequantRow(q, 0, back.data());
+
+        double worst = 0.0, scale = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            worst = std::max(worst, (double)std::fabs(back[i] - original[i]));
+            scale = std::max(scale, (double)std::fabs(original[i]));
+        }
+
+        /* one step of the integer grid is the most any value can be off by,
+           so the bound is the block range over the number of levels */
+        const double levels = (t == ai::quant::Type::Q8) ? 127.0 : 7.0;
+        const double bound = scale / levels;
+
+        char note[160];
+        std::snprintf(note, sizeof(note),
+                      "%s error stays within one quantisation step (%.4f <= %.4f)",
+                      ai::quant::typeName(t), worst, bound * 1.01);
+        check(note, worst <= bound * 1.01);
+    }
+
+    check("a row length that is not a multiple of the block size is refused",
+          !ai::quant::quantize(src.data(), 1, ai::quant::BLOCK + 1, ai::quant::Type::Q8).valid());
+
+    check("q8 is about half of bfloat16", [] {
+        return ai::quant::bytesPerWeight(ai::quant::Type::Q8) < 1.2
+            && ai::quant::bytesPerWeight(ai::quant::Type::Q8) > 1.0;
+    }());
+    check("q4 is under a third of bfloat16",
+          ai::quant::bytesPerWeight(ai::quant::Type::Q4) < 2.0 / 3.0);
+}
+
+
+static void testQuantModel(const std::string& dir) {
+    section("quantised model");
+
+    ai::LocalModel ref;
+    if (!ref.load(dir)) { check("the reference model loads", false); return; }
+
+    const std::vector<size_t> ids = {3838, 374, 279, 6722, 315, 9625, 30};
+
+    ai::LocalCache c; c.resize(ref.cfg, 128);
+    std::vector<float> refLogits(ref.cfg.vocab);
+    ref.forward(ids.data(), ids.size(), 0, c, refLogits.data());
+
+    const size_t refBytes = ref.weights.residentBytes();
+    const size_t refTop = ai::LocalModel::argmax(refLogits.data(), ref.cfg.vocab);
+
+    for (ai::quant::Type t : {ai::quant::Type::Q8, ai::quant::Type::Q4}) {
+        ai::LocalModel m;
+        if (!m.load(dir, {}, t)) {
+            check(std::string(ai::quant::typeName(t)) + " loads", false);
+            continue;
+        }
+        check(std::string(ai::quant::typeName(t)) + " loads", true);
+        check(std::string(ai::quant::typeName(t)) + " reports its type", m.quantType == t);
+
+        const size_t bytes = m.weights.residentBytes();
+        const double ratio = double(refBytes) / double(bytes);
+
+        char note[160];
+        std::snprintf(note, sizeof(note), "%s is %.2fx smaller (%zu MB vs %zu MB)",
+                      ai::quant::typeName(t), ratio,
+                      bytes / (1024 * 1024), refBytes / (1024 * 1024));
+        check(note, ratio > (t == ai::quant::Type::Q8 ? 1.6 : 2.8));
+
+        ai::LocalCache qc; qc.resize(m.cfg, 128);
+        std::vector<float> logits(m.cfg.vocab);
+        m.forward(ids.data(), ids.size(), 0, qc, logits.data());
+
+        /*
+            q8 is close enough to demand the same token. q4 is not, and
+            pretending otherwise would be a test that lies: on a small model
+            it genuinely does pick differently sometimes. What it must not do
+            is leave the neighbourhood, so the bar is that its choice is
+            still among the reference's most likely few.
+        */
+        const size_t got = ai::LocalModel::argmax(logits.data(), m.cfg.vocab);
+
+        if (t == ai::quant::Type::Q8) {
+            check("q8 picks the same next token as bfloat16", got == refTop);
+        } else {
+            std::vector<size_t> order(ref.cfg.vocab);
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::partial_sort(order.begin(), order.begin() + 10, order.end(),
+                              [&](size_t a, size_t b) { return refLogits[a] > refLogits[b]; });
+
+            bool inTop = false;
+            for (int i = 0; i < 10; ++i) if (order[static_cast<size_t>(i)] == got) inTop = true;
+
+            char where[160];
+            std::snprintf(where, sizeof(where),
+                          "q4 stays in the reference top 10 (picked %zu, bfloat16 picked %zu)",
+                          got, refTop);
+            check(where, inTop);
+        }
+
+        /* the cache is still pure optimisation, quantised or not */
+        ai::LocalCache step; step.resize(m.cfg, 128);
+        std::vector<float> stepped(m.cfg.vocab);
+        for (size_t i = 0; i < ids.size(); ++i)
+            m.forward(&ids[i], 1, i, step, stepped.data());
+
+        double worst = 0.0;
+        for (size_t i = 0; i < m.cfg.vocab; ++i)
+            worst = std::max(worst, (double)std::fabs(logits[i] - stepped[i]));
+        std::snprintf(note, sizeof(note),
+                      "%s decoding one at a time still matches a single pass (%.2e)",
+                      ai::quant::typeName(t), worst);
+        check(note, worst < 5e-3);
+    }
+}
+
+
+/* ========================================================================= //
+    Qwen3-Next
+
+    A tiny randomly initialised model rather than the real 151GB checkpoint:
+    the architecture is identical, and the two pieces worth doubting - the
+    per-key-head de-interleaving of the fused linear-attention projections,
+    and the routing of a token to its handful of experts - are exercised just
+    as thoroughly at eight experts as at five hundred.
+// ========================================================================= */
+
+static void testQwen3Next(const std::string& dir, const std::string& oracleDir) {
+    section("qwen3_next through LocalModel");
+
+    if (!fs::exists(dir + "/config.json")) {
+        std::cout << "    skipped: no model at " << dir
+                  << " (py tools/qwen3next_oracle.py)" << std::endl;
+        return;
+    }
+
+    ai::LocalModel model;
+    if (!model.load(dir)) {
+        check("qwen3_next loads (" + model.error + ")", false);
+        return;
+    }
+    check("qwen3_next loads", true);
+
+    check("detected as qwen3_next", model.modelType == "qwen3_next");
+
+    /* the layer kinds come from a stride rather than a list, so check the
+       stride was read the way transformers reads it: counting from one */
+    check("full attention every second layer, counting from one",
+          model.cfg.mixers.size() == 4
+       && model.cfg.mixers[0] == ai::MixerKind::GatedDeltaNet
+       && model.cfg.mixers[1] == ai::MixerKind::Attention
+       && model.cfg.mixers[2] == ai::MixerKind::GatedDeltaNet
+       && model.cfg.mixers[3] == ai::MixerKind::Attention);
+
+    check("8 experts, 3 per token",
+          model.cfg.numExperts == 8 && model.cfg.expertsPerToken == 3);
+    check("the experts were all loaded",
+          model.layers[0].experts.size() == 8
+       && model.layers[0].experts[7].down.valid());
+    check("the router and shared expert were loaded",
+          model.layers[0].router.valid()
+       && model.layers[0].shared.up.valid()
+       && model.layers[0].sharedScale.outDim == 1);
+
+    check("the linear projections are fused",
+          model.layers[0].linQKV.valid() && !model.layers[0].linZ.valid());
+    check("in_proj_qkvz is 2*keyDim + 2*valueDim wide",
+          model.layers[0].linQKV.outDim
+       == 2 * model.cfg.linKeyWidth() + 2 * model.cfg.linValueWidth());
+    check("in_proj_ba is two per value head",
+          model.layers[0].linA.outDim == 2 * model.cfg.linValueHeads);
+
+    check("a quarter of each head rotates", model.cfg.rotaryDims() == 4);
+
+    const std::vector<size_t> ids = {5, 17, 42, 7, 300, 12};
+    diffAgainstOracle(model, ids, oracleDir, 5e-3, 429);
+    testCache(model, ids);
+}
+
+
+/* ========================================================================= //
+    Synthetic weights
+
+    Running a topology with invented numbers is only useful if the numbers
+    are plausible: draw them too large and the residual stream saturates,
+    every logit comes back NaN, and the run says nothing about the
+    architecture. So the checks here are that it stays finite, that a seed
+    reproduces itself exactly, and that a different seed is a different
+    model - not that the output means anything, because it cannot.
+// ========================================================================= */
+
+/* ========================================================================= //
+    Perturbed weights
+
+    The trained weights, each offset by a uniform draw from +/-epsilon.
+
+    The load for this goes down a different road than a plain one - read,
+    widen to float, adjust, narrow back - so the first thing to establish is
+    that the road itself changes nothing. An epsilon too small for bfloat16
+    to represent has to come back bit-identical to a plain load; if it does
+    not, every later measurement is measuring the plumbing.
+// ========================================================================= */
+
+static void testPerturbed(const std::string& dir) {
+    section("perturbed weights: " + dir);
+
+    if (!fs::exists(dir + "/config.json")) {
+        std::cout << "    skipped: no model at " << dir << std::endl;
+        return;
+    }
+
+    const std::vector<size_t> ids = {5, 17, 42, 7, 300, 12};
+
+    struct Run {
+        std::vector<float> logits;
+        size_t changed = 0;
+        size_t offered = 0;
+        bool   ok = false;
+    };
+
+    auto runWith = [&](float epsilon, uint64_t seed) {
+        Run r;
+        ai::LocalModel m;
+        const std::optional<uint64_t> s =
+            (epsilon > 0.0f) ? std::optional<uint64_t>(seed) : std::nullopt;
+
+        if (!m.load(dir, {}, ai::quant::Type::None, s, epsilon)) return r;
+
+        ai::LocalCache cache;
+        cache.resize(m.cfg, 64);
+        r.logits.assign(m.cfg.vocab, 0.0f);
+        m.forward(ids.data(), ids.size(), 0, cache, r.logits.data());
+        r.changed = m.weights.changedValues;
+        r.offered = m.weights.perturbedValues;
+        r.ok = true;
+        return r;
+    };
+
+    const Run plain = runWith(0.0f, 0);
+    if (!plain.ok) { check("the model loads unperturbed", false); return; }
+    check("the model loads unperturbed", true);
+
+    /*
+        The perturbing load takes a different road than a plain one - read,
+        widen to float, adjust, narrow back - so before measuring anything,
+        establish that the road itself changes nothing. An adjustment that
+        does nothing has to give the original model bit for bit.
+
+        Doing this with a very small epsilon instead would NOT work, and the
+        reason is worth knowing: about 0.004% of the weights in these files
+        are exactly zero, and bfloat16 represents magnitudes down to 1e-38,
+        so adding any nonzero offset at all to a zero weight changes it. The
+        floor on a perturbation is not bfloat16's precision - it is whether
+        the weight was zero to begin with.
+    */
+    check("the adjust path is lossless when the adjustment does nothing", [&] {
+        ai::LocalModel m;
+        m.weights.perturb = [](const std::string&, const ai::TensorInfo&, float*) {};
+        if (!m.load(dir)) return false;
+
+        ai::LocalCache cache;
+        cache.resize(m.cfg, 64);
+        std::vector<float> through(m.cfg.vocab, 0.0f);
+        m.forward(ids.data(), ids.size(), 0, cache, through.data());
+
+        check("  (and it did take the adjust path)", m.weights.perturbedValues > 0);
+        return through == plain.logits;
+    }());
+
+    /* a barely-there offset should reach almost nothing but the zeros */
+    const Run tiny = runWith(1e-12f, 1);
+    if (!tiny.ok) { check("a tiny perturbation loads", false); return; }
+
+    const double reached = 100.0 * double(tiny.changed) / double(tiny.offered);
+    std::cout << "    eps 1e-12 changed " << reached
+              << "% of weights (the exact zeros)" << std::endl;
+    check("an offset far below every weight's own scale reaches only the zeros",
+          reached > 0.0 && reached < 0.5);
+
+    /* an offset comparable to the weights themselves must land everywhere */
+    const Run big = runWith(0.05f, 1);
+    if (!big.ok) { check("a large perturbation loads", false); return; }
+
+    const double landed = 100.0 * double(big.changed) / double(big.offered);
+    std::cout << "    eps 0.05 changed " << landed << "% of weights" << std::endl;
+    check("an offset the size of the weights lands on nearly all of them",
+          landed > 95.0);
+    check("and changes what the model predicts", big.logits != plain.logits);
+
+    /*
+        The offset has to be SYMMETRIC. A draw from [0, eps] instead of
+        [-eps, +eps] still changes every weight and still degrades the model,
+        so nothing above would notice - but it is a systematic shift of the
+        whole checkpoint rather than noise on it, and that is a different
+        experiment answering a different question. Measured directly: the
+        mean change across a large matrix must sit near zero, not near
+        eps/2.
+    */
+    check("the offset is symmetric, not a systematic shift", [&] {
+        const float eps = 0.01f;
+
+        ai::LocalModel a, b;
+        if (!a.load(dir)) return false;
+        if (!b.load(dir, {}, ai::quant::Type::None, std::optional<uint64_t>(1), eps))
+            return false;
+
+        /* the embedding table, because layer 0 is not guaranteed to have a
+           q_proj - on qwen3_next it is a linear-attention layer and has none */
+        const ai::Tensor<uint16_t>& x = a.embed.bf16;
+        const ai::Tensor<uint16_t>& y = b.embed.bf16;
+        if (!x.storage || !y.storage || x.numel() != y.numel()) return false;
+
+        double total = 0.0;
+        const size_t n = x.numel();
+        for (size_t i = 0; i < n; ++i)
+            total += double(ai::quant::widenBF16(y.ptr[i]))
+                   - double(ai::quant::widenBF16(x.ptr[i]));
+
+        const double mean = total / double(n);
+        std::cout << "    mean change " << mean << " over " << n
+                  << " weights (one-sided would be " << eps / 2 << ")" << std::endl;
+
+        return std::fabs(mean) < double(eps) / 10.0;
+    }());
+
+    /* and it has to be reproducible, or a sweep means nothing */
+    const Run again = runWith(0.05f, 1);
+    check("the same seed and epsilon reproduce exactly",
+          again.ok && again.logits == big.logits);
+
+    const Run other = runWith(0.05f, 2);
+    check("a different seed perturbs differently",
+          other.ok && other.logits != big.logits);
+}
+
+
+static void testSynthetic(const std::string& dir) {
+    section("synthetic weights: " + dir);
+
+    if (!fs::exists(dir + "/config.json")) {
+        std::cout << "    skipped: no model at " << dir << std::endl;
+        return;
+    }
+
+    const std::vector<size_t> ids = {5, 17, 42, 7, 300, 12};
+
+    auto logitsFor = [&](uint64_t seed, std::vector<float>& out) {
+        ai::LocalModel m;
+        if (!m.load(dir, {}, ai::quant::Type::None, std::optional<uint64_t>(seed)))
+            return false;
+
+        ai::LocalCache cache;
+        cache.resize(m.cfg, 64);
+        out.assign(m.cfg.vocab, 0.0f);
+        m.forward(ids.data(), ids.size(), 0, cache, out.data());
+        return true;
+    };
+
+    std::vector<float> a, b, c;
+    if (!logitsFor(1, a)) { check("a synthetic model loads", false); return; }
+    check("a synthetic model loads with no weights read", true);
+
+    /*
+        The one decision in the policy that the logits cannot pin down. A
+        norm weight of twice the identity only doubles them - RMSNorm
+        renormalises away the rest - so no plausible bound on "an untrained
+        model's logits are small" would reject it.
+
+        So read the weight the loader ACTUALLY produced and check it is
+        scale-preserving. Recomputing the identity here instead would only
+        re-test this test's own arithmetic: it would agree with a broken
+        loader as readily as a working one.
+    */
+    check("the loaded norm weight is the identity for this convention", [&] {
+        ai::LocalModel m;
+        if (!m.load(dir, {}, ai::quant::Type::None, std::optional<uint64_t>(1)))
+            return false;
+        if (!m.finalNorm.storage) return false;
+
+        const size_t n = m.cfg.hidden;
+        std::vector<float> x(n), out(n);
+        for (size_t i = 0; i < n; ++i) x[i] = static_cast<float>(i % 7) - 3.0f;
+
+        ai::rmsNormRow(x.data(), m.finalNorm.ptr, out.data(), n,
+                       m.cfg.normEps, m.spec.normWeightOffset);
+
+        double energy = 0.0;
+        for (size_t i = 0; i < n; ++i) energy += double(out[i]) * double(out[i]);
+        const double rms = std::sqrt(energy / double(n));
+
+        std::cout << "    norm weight " << m.finalNorm.ptr[0]
+                  << " + offset " << m.spec.normWeightOffset
+                  << " -> rms " << rms << std::endl;
+        return std::fabs(rms - 1.0) < 1e-4;
+    }());
+
+    check("every logit is finite", [&] {
+        for (float v : a) if (!std::isfinite(v)) return false;
+        return true;
+    }());
+
+    /* an untrained model has no opinion, so the logits should sit close
+       together - a wide spread would mean the scale is wrong */
+    /* the bound is tight on purpose. An untrained model's logits sit near
+       zero; 50 would have passed an initialisation drawn fifty times too
+       wide, which measured 26 and is exactly the mistake worth catching */
+    check("the logits are small, as an untrained model's must be", [&] {
+        float worst = 0.0f;
+        for (float v : a) worst = std::max(worst, std::fabs(v));
+        std::cout << "    largest untrained logit: " << worst << std::endl;
+        return worst < 5.0f;
+    }());
+
+    /*
+        Each tensor's stream is seeded from its NAME. Seed them all alike and
+        every pair of same-shaped matrices comes out literally equal - a
+        model where q_proj and k_proj are the same matrix - and the logits
+        give no hint of it, so it is checked for directly.
+    */
+    check("two tensors of the same shape are not the same tensor", [&] {
+        ai::LocalModel m;
+        if (!m.load(dir, {}, ai::quant::Type::None, std::optional<uint64_t>(1)))
+            return false;
+
+        size_t compared = 0;
+        for (size_t i = 0; i < m.weights.raw.size() && compared < 50; ++i)
+            for (size_t j = i + 1; j < m.weights.raw.size() && compared < 50; ++j) {
+                const ai::Tensor<uint16_t>& x = m.weights.raw[i].second;
+                const ai::Tensor<uint16_t>& y = m.weights.raw[j].second;
+                if (x.shape != y.shape || x.numel() < 64) continue;
+
+                ++compared;
+                if (std::equal(x.ptr, x.ptr + 64, y.ptr)) {
+                    std::cout << "    identical: " << m.weights.raw[i].first
+                              << " and " << m.weights.raw[j].first << std::endl;
+                    return false;
+                }
+            }
+
+        std::cout << "    compared " << compared << " same-shaped pairs" << std::endl;
+        return compared > 0;
+    }());
+
+    if (!logitsFor(1, b)) { check("the same seed reloads", false); return; }
+    check("the same seed gives bit-identical logits", a == b);
+
+    if (!logitsFor(2, c)) { check("another seed loads", false); return; }
+    check("a different seed gives a different model", a != c);
+}
+
+
 int main(int argc, char** argv) {
     const std::string gpt2Dir   = argc > 1 ? argv[1] : "models/gpt2";
     const std::string qwenDir   = argc > 2 ? argv[2] : "models/qwen3-0.6b";
@@ -384,6 +863,17 @@ int main(int argc, char** argv) {
     testRegistry();
     testGPT2(gpt2Dir, gpt2Oracle);
     testQwen3(qwenDir, qwenOracle);
+    testQwen3Next(argc > 5 ? argv[5] : "models/tiny-qwen3next",
+                  argc > 6 ? argv[6] : "out/qwen3next-oracle");
+    /* both norm conventions: qwen3 stores a scale that must start at one,
+       qwen3_next a deviation from one that must start at zero. A single
+       model cannot tell the two apart, so both are exercised */
+    testSynthetic(argc > 5 ? argv[5] : "models/tiny-qwen3next");
+    testSynthetic(qwenDir);
+    testPerturbed(argc > 5 ? argv[5] : "models/tiny-qwen3next");
+    testPerturbed(qwenDir);
+    testQuantRoundTrip();
+    testQuantModel(qwenDir);
 
     std::cout << "\n"
               << (failures ? COLOR_RED : COLOR_GREEN)
