@@ -12,6 +12,7 @@
 #include "BPE.hpp"
 #include "Kernels.hpp"
 #include "Safetensors.hpp"
+#include "gpu/Device.hpp"
 #include "Tensor.hpp"
 #include "../files/JSON.hpp"
 #include "../math/Random.hpp"
@@ -562,11 +563,29 @@ struct LocalConfig {
     keeps one call site rather than templating the whole model on dtype.
 // ========================================================================= */
 
+/*
+    DevDType:
+    - what is actually on the card, which the host tensors do not say on
+      their own. Kept per weight, so a model with a handful of matrices the
+      GPU cannot take is not a special case anywhere - each one falls back
+      to the CPU by itself
+*/
+enum class DevDType { None, F32, BF16, Q8, Q4 };
+
 struct Weight {
     Tensor<float>       f32;
     Tensor<uint16_t>    bf16;
     quant::QuantTensor  q;
     Tensor<float>       bias;             // empty when the model has none
+
+    /*
+        the same bytes in VRAM. Nothing is converted on the way: the
+        quantiser has already run during load, so this is a straight copy
+        of the codes and scales the CPU kernels read
+    */
+    gpu::BufferRef      dev;
+    gpu::BufferRef      devScales;        // quantised only
+    DevDType            devType = DevDType::None;
 
     size_t outDim = 0, inDim = 0;
 
@@ -576,6 +595,30 @@ struct Weight {
     bool isBF16() const { return bf16.storage != nullptr; }
     bool isQuant() const { return q.valid(); }
     bool hasBias() const { return bias.storage != nullptr; }
+    bool onDevice() const { return devType != DevDType::None && dev && dev->valid(); }
+
+    /* the codes, without the scales that go with them */
+    size_t quantCodeBytes() const {
+        const size_t weights = q.outDim * q.inDim;
+        return (q.type == quant::Type::Q4) ? weights / 2 : weights;
+    }
+    size_t quantScaleBytes() const {
+        return q.outDim * q.blocksPerRow() * sizeof(float);
+    }
+
+    /* the contiguous block a device copy would be made from */
+    const void* hostBytes() const {
+        if (isQuant()) return q.quants.get();
+        if (isBF16())  return bf16.isContiguous() ? bf16.ptr : nullptr;
+        if (f32.storage) return f32.isContiguous() ? f32.ptr : nullptr;
+        return nullptr;
+    }
+    size_t deviceBytes() const {
+        if (isQuant()) return quantCodeBytes() + quantScaleBytes();
+        if (isBF16())  return bf16.numel() * sizeof(uint16_t);
+        if (f32.storage) return f32.numel() * sizeof(float);
+        return 0;
+    }
 };
 
 
@@ -587,6 +630,32 @@ struct Weight {
 */
 inline void apply(const float* x, const Weight& W, float* out, size_t rows,
                   bool threaded = true) {
+    if (W.onDevice()) {
+        switch (W.devType) {
+            case DevDType::Q4:
+                gpu::matmulNTQ4(x, *W.dev, *W.devScales, out, rows, W.inDim, W.outDim);
+                break;
+            case DevDType::Q8:
+                gpu::matmulNTQ8(x, *W.dev, *W.devScales, out, rows, W.inDim, W.outDim);
+                break;
+            case DevDType::BF16:
+                gpu::matmulNTBF16(x, *W.dev, out, rows, W.inDim, W.outDim);
+                break;
+            default:
+                gpu::matmulNT(x, *W.dev, out, rows, W.inDim, W.outDim);
+                break;
+        }
+
+        /* folded on the host: C has just been copied back anyway, so this
+           is one pass over a vector that is already warm rather than a
+           second kernel and a second launch */
+        if (W.hasBias())
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t j = 0; j < W.outDim; ++j)
+                    out[r * W.outDim + j] += W.bias.ptr[j];
+        return;
+    }
+
     if (W.isQuant())
         kernels::matmulNTQuant(x, W.q, out, rows, W.inDim, W.outDim, threaded);
     else if (W.isBF16())
@@ -1346,6 +1415,162 @@ struct LocalModel {
 
 
     size_t parameterCount() const { return weights.parameterCount(); }
+
+
+    /* ===================================================================== //
+        Moving the weights onto the device
+
+        The weights were already narrowed on the way in, so there is nothing
+        to convert here - the codes and scales the CPU kernels read are the
+        same bytes the card gets. Uploading is a copy and a pointer.
+    // ===================================================================== */
+
+    struct DeviceReport {
+        bool        ok       = false;
+        size_t      matrices = 0;
+        size_t      bytes    = 0;
+        std::string error;
+    };
+
+    /*
+        forEachMatrix(visit):
+        - every matrix a matmul reads. The embedding table is not here: it
+          is row-gathered on the host and never multiplied by. When lm_head
+          is tied it IS that table, and appears once, as lmHead.
+        - the linear-attention and mixture-of-experts weights are included,
+          so a Qwen3-Next layer uploads as readily as an attention one
+    */
+    template <typename Visit>
+    void forEachMatrix(Visit visit) {
+        visit(lmHead);
+
+        for (LocalLayer& L : layers) {
+            visit(L.q); visit(L.k); visit(L.v); visit(L.o);
+            visit(L.gate); visit(L.up); visit(L.down);
+
+            visit(L.linQKV); visit(L.linA); visit(L.linB);
+            visit(L.linZ);   visit(L.linOut);
+
+            visit(L.router); visit(L.sharedScale);
+            visit(L.shared.gate); visit(L.shared.up); visit(L.shared.down);
+            for (Expert& e : L.experts) {
+                visit(e.gate); visit(e.up); visit(e.down);
+            }
+        }
+    }
+
+    /*
+        deviceFootprint():
+        - what toDevice() would allocate, so a model that will not fit can
+          be turned away before half of it has crossed the bus
+    */
+    size_t deviceFootprint() {
+        size_t total = 0;
+        std::vector<const void*> seen;
+
+        forEachMatrix([&](Weight& w) {
+            const void* host = w.hostBytes();
+            if (!host) return;
+            for (const void* p : seen) if (p == host) return;
+            seen.push_back(host);
+            total += w.deviceBytes();
+        });
+
+        return total;
+    }
+
+    /*
+        toDevice():
+        - after this returns true, apply() routes through the GPU with no
+          other change anywhere: the dispatch is a field on Weight, not a
+          flag threaded through the forward pass.
+        - deduplicated by host pointer. A tied lm_head is literally the
+          embedding table, and on a 150k vocab that is over a gigabyte that
+          would otherwise sit in VRAM twice
+        - a weight the card will not take keeps devType None and runs on
+          the CPU, which is why a partial upload is a slower model rather
+          than a broken one
+    */
+    DeviceReport toDevice(const LoadProgress& onProgress = {}) {
+        DeviceReport report;
+
+        if (!gpu::available()) { report.error = gpu::lastError(); return report; }
+
+        const size_t needed = deviceFootprint();
+        const size_t free   = gpu::freeMemory();
+        if (free && needed > free) {
+            report.error = "needs " + std::to_string(needed >> 20) + " MB of VRAM, "
+                         + std::to_string(free >> 20) + " MB free";
+            return report;
+        }
+
+        struct Uploaded {
+            const void*    host;
+            gpu::BufferRef dev;
+            gpu::BufferRef scales;
+            DevDType       type;
+        };
+
+        std::vector<Uploaded> seen;
+        bool failed = false;
+
+        forEachMatrix([&](Weight& w) {
+            if (failed || !w.valid() || w.onDevice()) return;
+
+            const void* host = w.hostBytes();
+            if (!host) return;              // a view that would need gathering
+
+            for (const Uploaded& e : seen) {
+                if (e.host != host) continue;
+                w.dev = e.dev; w.devScales = e.scales; w.devType = e.type;
+                return;
+            }
+
+            gpu::BufferRef buffer, scales;
+            DevDType       type;
+
+            if (w.isQuant()) {
+                /* both kernels index scales per block of 32 along K, which
+                   quant::quantize guarantees by refusing anything else */
+                buffer = gpu::upload(w.q.quants.get(), w.quantCodeBytes());
+                scales = buffer ? gpu::upload(w.q.scales.get(), w.quantScaleBytes()) : nullptr;
+                type   = (w.q.type == quant::Type::Q4) ? DevDType::Q4 : DevDType::Q8;
+            } else if (w.isBF16()) {
+                buffer = gpu::upload(host, w.deviceBytes());
+                type   = DevDType::BF16;
+            } else {
+                buffer = gpu::upload(host, w.deviceBytes());
+                type   = DevDType::F32;
+            }
+
+            if (!buffer || (w.isQuant() && !scales)) {
+                failed = true;
+                report.error = gpu::lastError();
+                return;
+            }
+
+            w.dev = buffer; w.devScales = scales; w.devType = type;
+            seen.push_back({host, buffer, scales, type});
+
+            ++report.matrices;
+            report.bytes += w.deviceBytes();
+            if (onProgress) onProgress(report.bytes, needed, "uploading to " + gpu::deviceName());
+        });
+
+        if (failed) { toHost(); return report; }
+
+        report.ok = true;
+        return report;
+    }
+
+    /* drops every device buffer and puts the forward pass back on the CPU */
+    void toHost() {
+        forEachMatrix([](Weight& w) {
+            w.dev.reset();
+            w.devScales.reset();
+            w.devType = DevDType::None;
+        });
+    }
 
 
     /* ===================================================================== //

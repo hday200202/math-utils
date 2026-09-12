@@ -44,6 +44,9 @@ static void usage() {
         << "                        the trained weights and offset each one by a uniform\n"
         << "                        draw from +/-EPS. --seed reproduces either exactly\n"
         << "\n"
+        << "  --gpu        run the matmuls on the GPU. Uploads whatever the weights\n"
+        << "               already are - bfloat16, int8 or int4 - and combines with\n"
+        << "               --q8 / --q4 to fit a larger model on the card.\n"
         << "  --q8 / --q4  quantise the weight matrices as they load, so a model\n"
         << "               too large to hold in bfloat16 still fits. About half\n"
         << "               the size for q8, under a third for q4.\n"
@@ -146,6 +149,7 @@ int main(int argc, char** argv) {
     bool     chatSetByUser = false;
     bool     force = false;
     ai::quant::Type quantType = ai::quant::Type::None;
+    bool useGpu = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -179,6 +183,7 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--q8")                 { quantType = ai::quant::Type::Q8; }
         else if (arg == "--q4")                 { quantType = ai::quant::Type::Q4; }
+        else if (arg == "--gpu")                { useGpu = true; }
         else if (!arg.empty() && arg[0] != '-' && modelDir.empty()) { modelDir = arg; }
         else { std::cout << "unknown option: " << arg << "\n"; usage(); return 1; }
     }
@@ -266,6 +271,35 @@ int main(int argc, char** argv) {
     }
     const double loadSeconds = std::chrono::duration<double>(clock::now() - loadBegin).count();
 
+    /*
+        Uploading is a separate step from loading on purpose. The weights
+        are read, checked and narrowed exactly as they always were, and
+        only then does a pointer per matrix change - so a GPU run and a CPU
+        run are the same model in the same form, differing in where the
+        matmul happens and nothing else. That is what makes the two
+        comparable when they disagree.
+    */
+    std::string deviceLine = "CPU";
+    if (useGpu) {
+        const size_t footprint = model.deviceFootprint();
+        std::cout << "uploading " << formatBytes(footprint) << " to the GPU" << std::endl;
+
+        const clock::time_point uploadBegin = clock::now();
+        const ai::LocalModel::DeviceReport report = model.toDevice(drawBar);
+        clearBar();
+
+        if (!report.ok) {
+            std::cout << "GPU unavailable: " << report.error << "\n"
+                      << "continuing on the CPU.\n";
+        } else {
+            const double seconds =
+                std::chrono::duration<double>(clock::now() - uploadBegin).count();
+            deviceLine = ai::gpu::deviceName() + ", " + formatBytes(report.bytes)
+                       + " " + ai::quant::typeName(quantType)
+                       + " in " + std::to_string(seconds).substr(0, 4) + "s";
+        }
+    }
+
     if (context > model.cfg.maxPositions) context = model.cfg.maxPositions;
 
     /* a base model has no chat tokens, so wrapping its input in a template
@@ -293,6 +327,7 @@ int main(int argc, char** argv) {
                                    << ", " << (model.weights.residentBytes() / (1024 * 1024))
                                    << " MB resident\n"
               << "  threads      " << ai::kernels::Pool::instance().size() << "\n"
+              << "  device       " << deviceLine << "\n"
               << "  chat format  " << model.chatFormatName() << "\n"
               << "  context      " << context << "\n"
               << "  loaded in    " << loadSeconds << "s" << std::endl;

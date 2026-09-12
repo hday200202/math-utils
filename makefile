@@ -156,16 +156,52 @@ debug-llm:
 	clear
 	mkdir -p bin/debug
 	echo "building llm debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp src/gpu/Stub.cpp -Werror -Wall
 
 release-llm:
 	clear
 	mkdir -p bin/release
 	echo "building llm release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp src/gpu/Stub.cpp -Werror -Wall
 
 release-llm-test:
 	clear
 	mkdir -p bin/release
 	echo "building llm tests release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm-testing src/llm-testing.cpp -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm-testing src/llm-testing.cpp src/gpu/Stub.cpp -Werror -Wall
+
+
+# ========================================================================= #
+#   GPU
+#
+#   Only src/gpu/Kernels.hip goes through hipcc; everything else stays on
+#   g++ -std=c++26 and links the object. include/ai/gpu/Device.hpp is plain
+#   C++ on purpose so that boundary holds.
+#
+#   GPU_ARCH must match the card. gfx1100 is RDNA3 - the 7900 XT/XTX. Ask
+#   rocminfo if unsure:  rocminfo | grep gfx
+# ========================================================================= #
+
+HIPCC    ?= /opt/rocm/bin/hipcc
+GPU_ARCH ?= gfx1100
+HIP_LIBS  = -L/opt/rocm/lib -lamdhip64
+
+bin/obj/gpu-kernels.o: src/gpu/Kernels.hip include/ai/gpu/Device.hpp
+	mkdir -p bin/obj
+	echo "compiling HIP kernels for $(GPU_ARCH)..."
+	$(HIPCC) --offload-arch=$(GPU_ARCH) -std=c++17 -O3 -c src/gpu/Kernels.hip -o bin/obj/gpu-kernels.o
+
+release-llm-gpu: bin/obj/gpu-kernels.o
+	clear
+	mkdir -p bin/release
+	echo "building llm release with GPU backend..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm-gpu src/LLM.cpp bin/obj/gpu-kernels.o $(HIP_LIBS) -Werror -Wall
+
+release-gpu-test: bin/obj/gpu-kernels.o
+	clear
+	mkdir -p bin/release
+	echo "building gpu tests release..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpu-testing src/gpu-testing.cpp bin/obj/gpu-kernels.o $(HIP_LIBS) -Werror -Wall
+
+gpu-test: release-gpu-test
+	./bin/release/gpu-testing

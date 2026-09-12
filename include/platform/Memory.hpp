@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
 
 #if defined(_WIN32)
     #ifndef NOMINMAX
@@ -78,6 +79,38 @@ inline size_t availableMemory() {
          * static_cast<size_t>(pageSize);
 
 #else
+    /*
+        MemAvailable, not _SC_AVPHYS_PAGES.
+
+        _SC_AVPHYS_PAGES is MemFree, which counts only pages nobody is
+        using at all. Page cache is not in it. On a machine that has just
+        read a checkpoint that is almost the whole story: the file is in
+        cache, MemFree reads a few hundred MB, and a loader that trusts it
+        refuses to open a model the machine has ample room for.
+
+        MemAvailable is the kernel's own estimate of what a new allocation
+        could get, cache reclaim included - which is the question being
+        asked here. It has been published since Linux 3.14; the older path
+        stays as a fallback for anything that does not have it.
+    */
+    if (std::FILE* meminfo = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        size_t kilobytes = 0;
+        bool found = false;
+
+        while (std::fgets(line, sizeof(line), meminfo)) {
+            unsigned long long value = 0;
+            if (std::sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
+                kilobytes = static_cast<size_t>(value);
+                found = true;
+                break;
+            }
+        }
+
+        std::fclose(meminfo);
+        if (found) return kilobytes * 1024;
+    }
+
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page  = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page <= 0) return 0;

@@ -101,8 +101,9 @@ inline float widenBF16(uint16_t h) {
       The scale is the block's largest magnitude over the integer range, which
       means the largest weight is represented exactly and everything else
       rounds to the nearest step.
-    - Q4 packs two weights per byte, the even index in the low nibble. The
-      stored value is offset by 8 so the range 0..15 covers -8..7
+    - Q4 packs two weights per byte - weight j and weight j+16 - offset by 8
+      so the stored range 0..15 covers -8..7. See the Q4 branch for why the
+      scale and the pairing are both chosen the way they are
 */
 inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
                         size_t inDim, Type type) {
@@ -111,9 +112,11 @@ inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
     for (size_t b = 0; b < blocks; ++b) {
         const uint16_t* in = src + b * BLOCK;
 
-        float amax = 0.0f;
-        for (size_t j = 0; j < BLOCK; ++j)
-            amax = std::max(amax, std::fabs(widenBF16(in[j])));
+        float amax = 0.0f, extreme = 0.0f;
+        for (size_t j = 0; j < BLOCK; ++j) {
+            const float v = widenBF16(in[j]);
+            if (std::fabs(v) > amax) { amax = std::fabs(v); extreme = v; }
+        }
 
         if (type == Type::Q8) {
             const float scale = amax / 127.0f;
@@ -126,16 +129,52 @@ inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
                 dst[j] = static_cast<int8_t>(std::clamp(v, -127, 127));
             }
         } else {
-            const float scale = amax / 7.0f;
-            const float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
-            scales[b] = scale;
+            /*
+                The scale comes from the SIGNED extreme over -8, not from the
+                magnitude over 7, and the difference is not cosmetic.
 
-            int8_t* dst = out + b * (BLOCK / 2);
-            for (size_t j = 0; j < BLOCK / 2; ++j) {
+                amax/7 maps the block onto codes -7..+7. That is fifteen of
+                the sixteen a nibble can hold - code 0 never occurs - and
+                every step is 14% coarser than it needs to be. Dividing the
+                signed extreme by -8 instead lands that element exactly on
+                code 0 or code 15, whichever side it is on, and uses the
+                whole range in between.
+
+                Measured on a real down_proj it is 9.16% reconstruction
+                error against 10.37%, for the same bytes. End to end on
+                Qwen3-0.6B it was the difference between +4.17% perplexity
+                and +30.63% - four bits has so little margin that a 12.5%
+                finer step compounds into something far larger over the
+                layers.
+
+                The cost is that the opposite end of the block clips at 7/8
+                of the extreme. Within 32 contiguous weights both ends are
+                rarely extreme, so the finer step wins and keeps winning.
+            */
+            const float scale = extreme / -8.0f;
+            const float inv = (scale != 0.0f) ? 1.0f / scale : 0.0f;
+            scales[b] = (scale != 0.0f) ? scale : 1.0f;
+
+            /*
+                Byte j carries weight j and weight j+16 - the two HALVES of
+                the block, not adjacent weights.
+
+                Pairing j with j+1 is the obvious choice and it costs
+                throughput: the low nibbles become the even-indexed weights
+                and the high nibbles the odd ones, so a CPU kernel has to
+                deinterleave two strided streams before it can multiply them
+                by the activations. Splitting the block in half instead
+                gives two CONTIGUOUS runs of sixteen, which took decoding
+                from 87.8 to 99.7 tok/s on Qwen3-0.6B. A GPU does not care
+                either way; this layout is chosen for the weaker consumer.
+            */
+            constexpr size_t HALF = BLOCK / 2;
+            int8_t* dst = out + b * HALF;
+            for (size_t j = 0; j < HALF; ++j) {
                 const int lo = std::clamp(
-                    static_cast<int>(std::lround(widenBF16(in[2 * j]) * inv)), -8, 7) + 8;
+                    static_cast<int>(std::lround(widenBF16(in[j]) * inv)) + 8, 0, 15);
                 const int hi = std::clamp(
-                    static_cast<int>(std::lround(widenBF16(in[2 * j + 1]) * inv)), -8, 7) + 8;
+                    static_cast<int>(std::lround(widenBF16(in[j + HALF]) * inv)) + 8, 0, 15);
                 dst[j] = static_cast<int8_t>((hi << 4) | lo);
             }
         }
@@ -216,10 +255,11 @@ inline float dotQ4(const float* a, const int8_t* q, const float* scales, size_t 
         const uint8_t* qr = reinterpret_cast<const uint8_t*>(q) + b * (BLOCK / 2);
         const float sc = scales[b];
 
-        for (size_t j = 0; j < BLOCK / 2; ++j) {
+        constexpr size_t HALF = BLOCK / 2;
+        for (size_t j = 0; j < HALF; ++j) {
             const uint8_t packed = qr[j];
-            acc[2 * j]     += ar[2 * j]     * (static_cast<float>(int(packed & 0x0F) - 8) * sc);
-            acc[2 * j + 1] += ar[2 * j + 1] * (static_cast<float>(int(packed >> 4)   - 8) * sc);
+            acc[j]        += ar[j]        * (static_cast<float>(int(packed & 0x0F) - 8) * sc);
+            acc[j + HALF] += ar[j + HALF] * (static_cast<float>(int(packed >> 4)   - 8) * sc);
         }
     }
 
@@ -246,12 +286,13 @@ inline void dequantRow(const QuantTensor& t, size_t row, float* out) {
         return;
     }
 
+    constexpr size_t HALF = BLOCK / 2;
     const uint8_t* q = reinterpret_cast<const uint8_t*>(t.quants.get()) + row * (t.inDim / 2);
     for (size_t b = 0; b < blocks; ++b)
-        for (size_t j = 0; j < BLOCK / 2; ++j) {
-            const uint8_t packed = q[b * (BLOCK / 2) + j];
-            out[b * BLOCK + 2 * j]     = static_cast<float>(int(packed & 0x0F) - 8) * scales[b];
-            out[b * BLOCK + 2 * j + 1] = static_cast<float>(int(packed >> 4)   - 8) * scales[b];
+        for (size_t j = 0; j < HALF; ++j) {
+            const uint8_t packed = q[b * HALF + j];
+            out[b * BLOCK + j]        = static_cast<float>(int(packed & 0x0F) - 8) * scales[b];
+            out[b * BLOCK + j + HALF] = static_cast<float>(int(packed >> 4)   - 8) * scales[b];
         }
 }
 
