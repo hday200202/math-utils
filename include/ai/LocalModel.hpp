@@ -2412,13 +2412,20 @@ struct LocalModel {
                     + "<|im_end|>\n<|im_start|>assistant\n";
 
                 /*
-                    The empty <think> block is how a reasoning model is told
-                    to skip its scratchpad. A model without those tokens has
-                    never seen them, so emitting the text anyway just puts
-                    six stray tokens in front of the answer
+                    An already-closed <think> block is how a reasoning model
+                    is told to skip its scratchpad; an open one is how it is
+                    invited to use it. Both are what the official template
+                    emits - it writes "<think>\n\n</think>\n\n" when
+                    thinking is off and "<think>\n" when it is on, so the
+                    model always finds the tag already opened for it either
+                    way.
+
+                    A model without those tokens has never seen them, so
+                    emitting the text anyway just puts stray tokens in front
+                    of the answer.
                 */
-                if (!thinking && tokenizer.hasSpecial("<think>"))
-                    prompt += "<think>\n\n</think>\n\n";
+                if (tokenizer.hasSpecial("<think>"))
+                    prompt += thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
 
                 return prompt;
             }

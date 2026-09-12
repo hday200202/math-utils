@@ -55,11 +55,38 @@ static constexpr const char* DEFAULT_SYSTEM =
     "tool-call syntax. You cannot list files, read files, or run commands. "
     "Write your complete answer, with full code, in this one message.";
 
+/*
+    Reasoning effort.
+
+    Qwen3.5 and later carry a dial for how much scratchpad to spend before
+    answering, and it is implemented as nothing more than a sentence at the
+    top of the system turn - these sentences, copied verbatim from the
+    model's own chat_template so the wording is the one it was tuned on.
+
+    Three levels, and only three: the template raises on anything else.
+    "medium" deliberately says nothing at all - it is the model's own
+    baseline, not a middle instruction.
+
+    The dial only means anything when thinking is ON, which is why asking
+    for an effort turns thinking on. With the scratchpad closed there is no
+    reasoning to calibrate and the sentence would be dead weight.
+*/
+static const char* effortInstruction(const std::string& level) {
+    if (level == "xhigh")
+        return "Reasoning effort is set to xhigh. Please think carefully through "
+               "the task, validate key assumptions, consider plausible alternatives, "
+               "and prioritize correctness, consistency, and clarity in the final answer.";
+    if (level == "low")
+        return "Reasoning effort is set to low. Keep your thinking brief and focused, "
+               "moving directly to the conclusion without unnecessary elaboration.";
+    return "";                      // medium carries no instruction
+}
+
 static void usage() {
     std::cout
         << "usage: LLM <model-dir> [--tokens N] [--temp F] [--topk N]\n"
         << "           [--seed N] [--ctx N] [--raw] [--force] [--q8|--q4] [--prompt TEXT]\n"
-        << "           [--system TEXT] [--no-system]\n"
+        << "           [--system TEXT] [--no-system] [--effort low|medium|xhigh]\n"
         << "           [--random [EPS]]\n"
         << "                        with no EPS, run the topology with invented weights,\n"
         << "                        reading no payload at all. With EPS in (0, 1], keep\n"
@@ -72,6 +99,10 @@ static void usage() {
         << "  --vram N     cap the GPU at N gigabytes. A model that does not fit puts\n"
         << "               as many whole layers on the card as will and runs the rest\n"
         << "               on the CPU - slower than all-GPU, but it runs.\n"
+        << "  --effort L   let the model think before answering, at low, medium or\n"
+        << "               xhigh effort. Off by default: the scratchpad is closed and\n"
+        << "               the answer comes straight out. Only Qwen3.5 and later have\n"
+        << "               the dial; the reasoning is printed along with the answer.\n"
         << "  --system T   replace the preamble that tells the model there are no tools\n"
         << "               to call and to answer directly. --no-system drops it; a\n"
         << "               model that was not trained to call tools does not need it.\n"
@@ -189,6 +220,7 @@ int main(int argc, char** argv) {
     bool useGpu = false;
     double vramCapGB = 0.0;
     std::string systemPrompt = DEFAULT_SYSTEM;
+    std::string effort;            // empty = do not think at all
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -205,6 +237,7 @@ int main(int argc, char** argv) {
         else if (arg == "--raw")                { chat = false; chatSetByUser = true; }
         else if (arg == "--system" && hasNext)  { systemPrompt = argv[++i]; }
         else if (arg == "--no-system")          { systemPrompt.clear(); }
+        else if (arg == "--effort" && hasNext)   { effort = argv[++i]; }
         else if (arg == "--force")              { force = true; }
         else if (arg == "--random") {
             random = true;
@@ -234,6 +267,19 @@ int main(int argc, char** argv) {
         usage();
         listModels("models");
         return 1;
+    }
+
+    if (!effort.empty() && effort != "low" && effort != "medium" && effort != "xhigh") {
+        std::cout << "unknown --effort \"" << effort << "\": expected low, medium or xhigh\n";
+        return 1;
+    }
+
+    /* the dial is a sentence at the top of the system turn, ahead of
+       whatever else is there, exactly where the official template puts it */
+    if (!effort.empty()) {
+        const std::string line = effortInstruction(effort);
+        if (!line.empty())
+            systemPrompt = systemPrompt.empty() ? line : line + "\n\n" + systemPrompt;
     }
 
     using clock = std::chrono::steady_clock;
@@ -447,7 +493,8 @@ int main(int argc, char** argv) {
         const auto build = [&] {
             const bool first = (cache.length == 0);
             const std::string text = chat
-                ? model.chatPrompt(userText, false, first ? systemPrompt : std::string())
+                ? model.chatPrompt(userText, !effort.empty(),
+                                   first ? systemPrompt : std::string())
                 : userText;
             return model.tokenizer.encode(text, first);
         };
