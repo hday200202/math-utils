@@ -1,3 +1,47 @@
+# ========================================================================= #
+#   GPU detection
+#
+#   There is one llm binary, not two. include/ai/gpu/Device.hpp is plain
+#   C++ with no HIP types in it, so every translation unit compiles the
+#   same way everywhere and only the BACKEND differs at link time:
+#
+#       ROCm present   src/gpu/Kernels.hip through hipcc, linked in
+#       ROCm absent    src/gpu/Stub.cpp, where available() is false
+#
+#   The stub is not a stripped-down build. --gpu still parses, still asks,
+#   and is told no - which is the same path taken when a card is present
+#   but busy, so there is one behaviour to reason about rather than two.
+#
+#       make release-llm            use the GPU if this machine has one
+#       make release-llm GPU=0      no-device build even where ROCm exists
+#       make release-llm GPU_ARCH=gfx1030   a card that is not RDNA3
+# ========================================================================= #
+
+HIPCC    ?= /opt/rocm/bin/hipcc
+GPU_ARCH ?= gfx1100
+GPU      ?= auto
+
+ifeq ($(GPU),auto)
+    HAVE_HIP := $(shell test -x $(HIPCC) && echo 1)
+else ifeq ($(GPU),0)
+    HAVE_HIP :=
+else
+    HAVE_HIP := 1
+endif
+
+ifeq ($(HAVE_HIP),1)
+    GPU_BACKEND = bin/obj/gpu-kernels.o
+    GPU_DEP     = bin/obj/gpu-kernels.o
+    GPU_LIBS    = -L/opt/rocm/lib -lamdhip64
+    GPU_NOTE    = with the HIP backend
+else
+    GPU_BACKEND = src/gpu/Stub.cpp
+    GPU_DEP     =
+    GPU_LIBS    =
+    GPU_NOTE    = no GPU backend on this machine
+endif
+
+
 all: release-quat release-tensor release-json release-llm release-llm-test
 
 test: release-quat release-tensor release-json release-llm-test
@@ -152,18 +196,20 @@ release-json:
 
 
 
-debug-llm:
+debug-llm: $(GPU_DEP)
 	clear
 	mkdir -p bin/debug
-	echo "building llm debug..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp src/gpu/Stub.cpp -Werror -Wall
+	echo "building llm debug, $(GPU_NOTE)..."
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp $(GPU_BACKEND) $(GPU_LIBS) -Werror -Wall
 
-release-llm:
+release-llm: $(GPU_DEP)
 	clear
 	mkdir -p bin/release
-	echo "building llm release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp src/gpu/Stub.cpp -Werror -Wall
+	echo "building llm release, $(GPU_NOTE)..."
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp $(GPU_BACKEND) $(GPU_LIBS) -Werror -Wall
 
+# the architecture suite, deliberately on the stub: it tests the model and
+# the loader, and has no business needing ROCm to build
 release-llm-test:
 	clear
 	mkdir -p bin/release
@@ -172,36 +218,32 @@ release-llm-test:
 
 
 # ========================================================================= #
-#   GPU
+#   GPU kernels
 #
 #   Only src/gpu/Kernels.hip goes through hipcc; everything else stays on
-#   g++ -std=c++26 and links the object. include/ai/gpu/Device.hpp is plain
-#   C++ on purpose so that boundary holds.
+#   g++ -std=c++26 and links the object.
 #
 #   GPU_ARCH must match the card. gfx1100 is RDNA3 - the 7900 XT/XTX. Ask
 #   rocminfo if unsure:  rocminfo | grep gfx
 # ========================================================================= #
-
-HIPCC    ?= /opt/rocm/bin/hipcc
-GPU_ARCH ?= gfx1100
-HIP_LIBS  = -L/opt/rocm/lib -lamdhip64
 
 bin/obj/gpu-kernels.o: src/gpu/Kernels.hip include/ai/gpu/Device.hpp
 	mkdir -p bin/obj
 	echo "compiling HIP kernels for $(GPU_ARCH)..."
 	$(HIPCC) --offload-arch=$(GPU_ARCH) -std=c++17 -O3 -c src/gpu/Kernels.hip -o bin/obj/gpu-kernels.o
 
-release-llm-gpu: bin/obj/gpu-kernels.o
+# unlike llm, this one genuinely cannot be built without a card to test
+release-gpu-test:
+ifneq ($(HAVE_HIP),1)
+	@echo "gpu-testing needs ROCm: $(HIPCC) not found."
+	@echo "set HIPCC=/path/to/hipcc, or build 'release-llm' for a CPU-only binary."
+	@false
+endif
 	clear
 	mkdir -p bin/release
-	echo "building llm release with GPU backend..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm-gpu src/LLM.cpp bin/obj/gpu-kernels.o $(HIP_LIBS) -Werror -Wall
-
-release-gpu-test: bin/obj/gpu-kernels.o
-	clear
-	mkdir -p bin/release
+	$(MAKE) bin/obj/gpu-kernels.o
 	echo "building gpu tests release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpu-testing src/gpu-testing.cpp bin/obj/gpu-kernels.o $(HIP_LIBS) -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpu-testing src/gpu-testing.cpp bin/obj/gpu-kernels.o $(GPU_LIBS) -Werror -Wall
 
 gpu-test: release-gpu-test
 	./bin/release/gpu-testing

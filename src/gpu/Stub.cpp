@@ -14,7 +14,7 @@ namespace gpu {
 
 namespace {
     const std::string NO_NAME;
-    const std::string NO_DEVICE = "built without a GPU backend (see release-llm-gpu)";
+    const std::string NO_DEVICE = "built without a GPU backend: no ROCm on the machine this was compiled on";
     const Counters    EMPTY;
 }
 
