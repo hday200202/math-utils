@@ -572,6 +572,19 @@ struct LocalConfig {
 */
 enum class DevDType { None, F32, BF16, Q8, Q4 };
 
+
+/*
+    OffloadPlan:
+    - how much of the model to put on the card. Everything by default,
+      as much as fits when it will not all go
+*/
+struct OffloadPlan {
+    size_t vramBudget  = 0;                  // 0 = whatever is free, less the reserve
+    size_t reserve     = size_t(512) << 20;  // left for scratch and the desktop
+    bool   releaseHost = true;
+};
+
+
 struct Weight {
     Tensor<float>       f32;
     Tensor<uint16_t>    bf16;
@@ -1426,9 +1439,15 @@ struct LocalModel {
     // ===================================================================== */
 
     struct DeviceReport {
-        bool        ok       = false;
-        size_t      matrices = 0;
-        size_t      bytes    = 0;
+        bool        ok         = false;
+        size_t      matrices   = 0;
+        size_t      bytes      = 0;
+        size_t      hostFreed  = 0;     // RAM handed back after uploading
+        size_t      budget     = 0;
+        size_t      layersOnDevice = 0;
+        size_t      layersTotal    = 0;
+        bool        headOnDevice   = false;
+        bool        partial        = false;
         std::string error;
     };
 
@@ -1441,22 +1460,24 @@ struct LocalModel {
           so a Qwen3-Next layer uploads as readily as an attention one
     */
     template <typename Visit>
+    static void forEachInLayer(LocalLayer& L, Visit visit) {
+        visit(L.q); visit(L.k); visit(L.v); visit(L.o);
+        visit(L.gate); visit(L.up); visit(L.down);
+
+        visit(L.linQKV); visit(L.linA); visit(L.linB);
+        visit(L.linZ);   visit(L.linOut);
+
+        visit(L.router); visit(L.sharedScale);
+        visit(L.shared.gate); visit(L.shared.up); visit(L.shared.down);
+        for (Expert& e : L.experts) {
+            visit(e.gate); visit(e.up); visit(e.down);
+        }
+    }
+
+    template <typename Visit>
     void forEachMatrix(Visit visit) {
         visit(lmHead);
-
-        for (LocalLayer& L : layers) {
-            visit(L.q); visit(L.k); visit(L.v); visit(L.o);
-            visit(L.gate); visit(L.up); visit(L.down);
-
-            visit(L.linQKV); visit(L.linA); visit(L.linB);
-            visit(L.linZ);   visit(L.linOut);
-
-            visit(L.router); visit(L.sharedScale);
-            visit(L.shared.gate); visit(L.shared.up); visit(L.shared.down);
-            for (Expert& e : L.experts) {
-                visit(e.gate); visit(e.up); visit(e.down);
-            }
-        }
+        for (LocalLayer& L : layers) forEachInLayer(L, visit);
     }
 
     /*
@@ -1491,18 +1512,48 @@ struct LocalModel {
           the CPU, which is why a partial upload is a slower model rather
           than a broken one
     */
-    DeviceReport toDevice(const LoadProgress& onProgress = {}) {
+    /*
+        toDevice(plan):
+        - uploads as much as the budget allows and leaves the rest on the
+          CPU. Partial offload needs no machinery in the forward pass at
+          all: apply() already dispatches on each weight's own devType, so
+          a matrix that never made it across simply runs the CPU kernel,
+          and a layer split down the middle is not a special case.
+        - it is not fast. A token still reads every weight once, so the
+          time is roughly cpuBytes/60GB/s + gpuBytes/400GB/s and the CPU
+          half dominates the moment it is more than a sliver. The point is
+          that a model one gigabyte too large runs a bit slower instead of
+          not at all.
+        - whole layers go or do not go. Splitting one would work, but "38
+          of 40 layers" is something you can reason about and "72% of the
+          matrices" is not.
+    */
+    DeviceReport toDevice(const OffloadPlan& plan = {}, const LoadProgress& onProgress = {}) {
         DeviceReport report;
+        report.layersTotal = layers.size();
 
         if (!gpu::available()) { report.error = gpu::lastError(); return report; }
 
         const size_t needed = deviceFootprint();
-        const size_t free   = gpu::freeMemory();
-        if (free && needed > free) {
-            report.error = "needs " + std::to_string(needed >> 20) + " MB of VRAM, "
-                         + std::to_string(free >> 20) + " MB free";
-            return report;
+
+        /*
+            What is free, less a reserve. The reserve is not superstition:
+            the scratch buffers that stage activations grow with the prompt
+            (a 512-token prefill against a 150k vocab is 300MB by itself),
+            and the desktop compositor wants its own VRAM back the moment
+            anything else on the machine redraws.
+        */
+        size_t budget = plan.vramBudget;
+        if (budget == 0) {
+            const size_t free = gpu::freeMemory();
+            budget = free > plan.reserve ? free - plan.reserve : 0;
         }
+        report.budget = budget;
+
+        /* what we expect to actually send, fixed here rather than read off
+           `budget` - that shrinks as layers commit, and a progress total
+           that shrinks while the numerator grows reports over 100% */
+        const size_t plannedTotal = std::min(needed, budget);
 
         struct Uploaded {
             const void*    host;
@@ -1514,7 +1565,16 @@ struct LocalModel {
         std::vector<Uploaded> seen;
         bool failed = false;
 
-        forEachMatrix([&](Weight& w) {
+        /* what this weight would add, counting a shared matrix only once */
+        auto costOf = [&](Weight& w) -> size_t {
+            if (!w.valid() || w.onDevice()) return 0;
+            const void* host = w.hostBytes();
+            if (!host) return 0;
+            for (const Uploaded& e : seen) if (e.host == host) return 0;
+            return w.deviceBytes();
+        };
+
+        auto upload = [&](Weight& w) {
             if (failed || !w.valid() || w.onDevice()) return;
 
             const void* host = w.hostBytes();
@@ -1554,16 +1614,101 @@ struct LocalModel {
 
             ++report.matrices;
             report.bytes += w.deviceBytes();
-            if (onProgress) onProgress(report.bytes, needed, "uploading to " + gpu::deviceName());
-        });
+            if (onProgress)
+                onProgress(report.bytes, plannedTotal,
+                           "uploading to " + gpu::deviceName());
+        };
+
+        /*
+            The output projection goes first. It is read once per token like
+            everything else, so nothing is gained by its position - but it
+            is a single large matrix, and having it either wholly on or
+            wholly off keeps the layer arithmetic below honest.
+        */
+        if (costOf(lmHead) <= budget) {
+            report.bytes = 0;
+            const size_t cost = costOf(lmHead);
+            upload(lmHead);
+            report.headOnDevice = !failed && lmHead.onDevice();
+            if (report.headOnDevice) budget -= cost;
+        }
+
+        for (LocalLayer& L : layers) {
+            if (failed) break;
+
+            size_t cost = 0;
+            forEachInLayer(L, [&](Weight& w) { cost += costOf(w); });
+
+            if (cost > budget) break;       // stop at the first that will not fit
+
+            forEachInLayer(L, upload);
+            if (failed) break;
+
+            budget -= cost;
+            ++report.layersOnDevice;
+        }
 
         if (failed) { toHost(); return report; }
+
+        report.partial = report.layersOnDevice < report.layersTotal || !report.headOnDevice;
+
+        /*
+            Drop the host copy of everything the card now holds.
+
+            Without this, --gpu costs exactly as much system RAM as running
+            on the CPU did - the weights sit in VRAM and in the heap at the
+            same time. Measured on Qwen3-8B that was 16.6 GB resident for a
+            model the GPU was doing all the work for, which on a 32GB
+            machine leaves no room for a desktop: the kernel OOM-killer
+            takes the process the moment an editor starts.
+
+            Only what actually went across is released, so under a partial
+            offload the layers still running on the CPU keep their weights
+            and stay usable.
+
+            The embedding table is deliberately untouched. It is row-
+            gathered on the host every token and never multiplied by, so it
+            is not in forEachMatrix and nothing here can reach it. A tied
+            lm_head shares its storage through a shared_ptr, so releasing
+            the lm_head view leaves the table itself alive.
+
+            The cost is that toHost() has nothing to fall back to
+            afterwards. Pass releaseHost false when a run needs to compare
+            the two paths against each other, which is what the test suite
+            does.
+        */
+        if (plan.releaseHost) {
+            forEachMatrix([&](Weight& w) {
+                if (!w.onDevice()) return;
+                w.bf16 = Tensor<uint16_t>();
+                w.f32  = Tensor<float>();
+                w.q    = quant::QuantTensor();
+                // the bias stays: apply() still folds it on the host
+            });
+
+            /*
+                and then at the level that actually owns the bytes. A Weight
+                is a view - ModelWeights keeps the storage - so clearing the
+                views above drops one reference each and frees nothing on
+                its own. This is the line that returns the memory.
+            */
+            report.hostFreed = weights.releaseUnreferenced();
+            hostReleased = true;
+        }
 
         report.ok = true;
         return report;
     }
 
-    /* drops every device buffer and puts the forward pass back on the CPU */
+    /* true once toDevice() has dropped the host weights, after which the
+       CPU path is no longer available without reloading */
+    bool hostReleased = false;
+
+    /*
+        drops every device buffer and puts the forward pass back on the CPU.
+        Only meaningful when the host copy was kept - see toDevice's
+        releaseHost
+    */
     void toHost() {
         forEachMatrix([](Weight& w) {
             w.dev.reset();
@@ -2230,20 +2375,41 @@ struct LocalModel {
 
     bool hasChatTemplate() const { return chatFormat() != ChatFormat::None; }
 
-    std::string chatPrompt(const std::string& user, bool thinking = false) const {
+    /*
+        chatPrompt(user, thinking, system):
+        - `system` is emitted only when it is non-empty, and belongs to the
+          START of a conversation. A follow-up turn appended to a live cache
+          must not repeat it: the earlier turns are already in the KV cache
+          and re-rendering them would put the whole preamble in twice.
+        - it is worth having at all because an instruct model trained on
+          agentic traces will otherwise reach for tools it does not have.
+          Ask one of those to write a program and it answers by listing the
+          directory and opening package.json, which is not a malfunction -
+          it is the behaviour it was taught, applied to a prompt that never
+          said there is no repository and no tools to call
+    */
+    std::string chatPrompt(const std::string& user, bool thinking = false,
+                           const std::string& system = {}) const {
         switch (chatFormat()) {
             case ChatFormat::MistralInst:
-                return "[INST] " + user + " [/INST]";
+                /* the format has no system role, and the convention is to
+                   put it at the top of the first instruction block */
+                return "[INST] " + (system.empty() ? "" : system + "\n\n")
+                     + user + " [/INST]";
 
             case ChatFormat::ChatMLSep:
                 // Phi-4 separates the role from the content with a token
                 // rather than a newline
-                return "<|im_start|>user<|im_sep|>" + user
+                return (system.empty() ? ""
+                        : "<|im_start|>system<|im_sep|>" + system + "<|im_end|>")
+                     + "<|im_start|>user<|im_sep|>" + user
                      + "<|im_end|><|im_start|>assistant<|im_sep|>";
 
             case ChatFormat::ChatML: {
-                std::string prompt = "<|im_start|>user\n" + user
-                                   + "<|im_end|>\n<|im_start|>assistant\n";
+                std::string prompt =
+                    (system.empty() ? "" : "<|im_start|>system\n" + system + "<|im_end|>\n")
+                    + "<|im_start|>user\n" + user
+                    + "<|im_end|>\n<|im_start|>assistant\n";
 
                 /*
                     The empty <think> block is how a reasoning model is told

@@ -1,8 +1,9 @@
 """
 Download a model from the HuggingFace Hub into models/<name>/.
 
-Only what the loader actually needs: config.json, a tokenizer, and the
-weight shards named by model.safetensors.index.json. Repos often ship
+Only what the loader actually needs, plus tokenizer_config.json for its
+chat_template: config.json, a tokenizer, and the weight shards named by
+model.safetensors.index.json. Repos often ship
 extras that would double the download for nothing - Mistral, for one,
 carries a consolidated.safetensors alongside its shards, which is the same
 13.5GB a second time.
@@ -285,8 +286,14 @@ def main():
         print("  no safetensors weights in this repo")
         return 1
 
+    # tokenizer_config.json is not needed to LOAD a model - the loader
+    # detects the chat format from which special tokens exist - but it is
+    # the only place the model's real chat_template lives, tool-call syntax
+    # and all. Without it there is no way to see what a model was trained
+    # to emit except by reading it back out of the model's own output.
     for extra in ("config.json", "generation_config.json",
-                  "tokenizer.json", "vocab.json", "merges.txt"):
+                  "tokenizer.json", "tokenizer_config.json",
+                  "vocab.json", "merges.txt"):
         if extra in sizes:
             wanted.append(extra)
 

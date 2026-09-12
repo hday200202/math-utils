@@ -422,7 +422,7 @@ static void testEndToEnd(const std::string& directory) {
 
     using clock = std::chrono::steady_clock;
     const clock::time_point uploadBegin = clock::now();
-    const ai::LocalModel::DeviceReport report = model.toDevice();
+    const ai::LocalModel::DeviceReport report = model.toDevice({ .releaseHost = false });
     const double uploadSeconds = std::chrono::duration<double>(clock::now() - uploadBegin).count();
 
     check("weights uploaded", report.ok);
@@ -529,7 +529,7 @@ static void testHostAgainstDevice(const std::string& directory) {
         std::vector<float> cpuLogits(model.cfg.vocab, 0.0f);
         model.forward(prompt.data(), prompt.size(), 0, cache, cpuLogits.data());
 
-        if (!model.toDevice().ok) { check("upload", false); return; }
+        if (!model.toDevice({ .releaseHost = false }).ok) { check("upload", false); return; }
 
         cache.reset();
         std::vector<float> gpuLogits(model.cfg.vocab, 0.0f);
@@ -563,7 +563,7 @@ static void testQuantisationQuality(const std::string& directory) {
     std::snprintf(line, sizeof(line), "%zu tokens, teacher forced, on the card", ids.size());
     note(line);
 
-    if (!wide.toDevice().ok) { check("bf16 uploads", false); return; }
+    if (!wide.toDevice({ .releaseHost = false }).ok) { check("bf16 uploads", false); return; }
     const std::vector<std::vector<float>> reference = teacherForced(wide, ids);
     wide.toHost();
 
@@ -573,7 +573,7 @@ static void testQuantisationQuality(const std::string& directory) {
     for (int pass = 0; pass < 2; ++pass) {
         ai::LocalModel narrow;
         if (!narrow.load(directory, {}, TYPES[pass])) { check("load", false); return; }
-        if (!narrow.toDevice().ok) { check("upload", false); return; }
+        if (!narrow.toDevice({ .releaseHost = false }).ok) { check("upload", false); return; }
 
         results[pass] = assess(reference, teacherForced(narrow, ids), ids);
         const Quality& q = results[pass];

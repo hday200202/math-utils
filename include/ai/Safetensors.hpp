@@ -575,6 +575,30 @@ struct ModelWeights {
     std::vector<std::pair<std::string, quant::QuantTensor>> quantized;
 
     /*
+        releaseUnreferenced():
+        - drops every quantised matrix that nothing outside this list still
+          holds, and reports the bytes recovered.
+        - the test is the reference count, not a name list, and that is what
+          makes it safe. A Weight is a COPY sharing the same shared_ptr, so
+          a matrix the model still reads has a count above one and is left
+          alone; one whose only remaining holder is this vector is dead.
+          The embedding table survives for exactly that reason - the model
+          row-gathers from it every token and therefore still holds it -
+          with no special case naming it.
+        - entries are emptied rather than erased so the slot indices that
+          point into this vector stay valid
+    */
+    size_t releaseUnreferenced() {
+        size_t freed = 0;
+        for (auto& e : quantized) {
+            if (!e.second.quants || e.second.quants.use_count() != 1) continue;
+            freed += e.second.byteCount();
+            e.second = quant::QuantTensor();
+        }
+        return freed;
+    }
+
+    /*
         Tensors whose names start with any of these are read past and never
         materialised. A Qwen3-Next checkpoint ships a multi-token-prediction
         head with its own 512 experts - roughly a gigabyte once quantised -

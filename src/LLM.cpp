@@ -34,10 +34,32 @@
         /quit      exit
 */
 
+/*
+    An instruct model trained on agentic coding traces does not answer a
+    "write me a program" prompt by writing the program. It answers by
+    orienting itself: listing the directory, opening package.json, calling
+    tools that in this harness do not exist. That is the behaviour it was
+    trained to have, applied to a prompt that never mentioned there is no
+    repository and nothing to call.
+
+    So say so - but say it in the model's own terms. Describing the
+    situation ("there are no tools, no file system, nothing to inspect")
+    was measured NOT to work on Qwen3.5-27B: it acknowledged the preamble
+    and went on emitting tool calls anyway. Naming the literal syntax it
+    must not produce did work, first try. The distinction seems to be
+    between a fact about the world, which a strong agentic prior overrides,
+    and an instruction about output, which it does not.
+*/
+static constexpr const char* DEFAULT_SYSTEM =
+    "There are no tools. Never emit <tool_call>, <function=, or any "
+    "tool-call syntax. You cannot list files, read files, or run commands. "
+    "Write your complete answer, with full code, in this one message.";
+
 static void usage() {
     std::cout
         << "usage: LLM <model-dir> [--tokens N] [--temp F] [--topk N]\n"
         << "           [--seed N] [--ctx N] [--raw] [--force] [--q8|--q4] [--prompt TEXT]\n"
+        << "           [--system TEXT] [--no-system]\n"
         << "           [--random [EPS]]\n"
         << "                        with no EPS, run the topology with invented weights,\n"
         << "                        reading no payload at all. With EPS in (0, 1], keep\n"
@@ -47,6 +69,12 @@ static void usage() {
         << "  --gpu        run the matmuls on the GPU. Uploads whatever the weights\n"
         << "               already are - bfloat16, int8 or int4 - and combines with\n"
         << "               --q8 / --q4 to fit a larger model on the card.\n"
+        << "  --vram N     cap the GPU at N gigabytes. A model that does not fit puts\n"
+        << "               as many whole layers on the card as will and runs the rest\n"
+        << "               on the CPU - slower than all-GPU, but it runs.\n"
+        << "  --system T   replace the preamble that tells the model there are no tools\n"
+        << "               to call and to answer directly. --no-system drops it; a\n"
+        << "               model that was not trained to call tools does not need it.\n"
         << "  --q8 / --q4  quantise the weight matrices as they load, so a model\n"
         << "               too large to hold in bfloat16 still fits. About half\n"
         << "               the size for q8, under a third for q4.\n"
@@ -107,7 +135,16 @@ static std::string formatBytes(size_t bytes) {
 static void drawBar(size_t done, size_t total, const std::string& stage) {
     constexpr int WIDTH = 28;
 
-    const double fraction = total ? double(done) / double(total) : 0.0;
+    /*
+        clamped, because this writes into a fixed-width buffer below and a
+        caller that reports more done than total would otherwise run off
+        the end of it. That is a heap overflow rather than a cosmetic bug,
+        and the caller does not have to be wrong on purpose - a total that
+        is refined while the work runs is enough
+    */
+    double fraction = total ? double(done) / double(total) : 0.0;
+    if (fraction < 0.0) fraction = 0.0;
+    if (fraction > 1.0) fraction = 1.0;
     const int filled = static_cast<int>(fraction * WIDTH);
 
     static int lastFilled = -1;
@@ -150,6 +187,8 @@ int main(int argc, char** argv) {
     bool     force = false;
     ai::quant::Type quantType = ai::quant::Type::None;
     bool useGpu = false;
+    double vramCapGB = 0.0;
+    std::string systemPrompt = DEFAULT_SYSTEM;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -164,6 +203,8 @@ int main(int argc, char** argv) {
         else if (arg == "--ctx"    && hasNext)  { context = std::strtoull(argv[++i], nullptr, 10); }
         else if (arg == "--prompt" && hasNext)  { oneShot = argv[++i]; }
         else if (arg == "--raw")                { chat = false; chatSetByUser = true; }
+        else if (arg == "--system" && hasNext)  { systemPrompt = argv[++i]; }
+        else if (arg == "--no-system")          { systemPrompt.clear(); }
         else if (arg == "--force")              { force = true; }
         else if (arg == "--random") {
             random = true;
@@ -184,6 +225,7 @@ int main(int argc, char** argv) {
         else if (arg == "--q8")                 { quantType = ai::quant::Type::Q8; }
         else if (arg == "--q4")                 { quantType = ai::quant::Type::Q4; }
         else if (arg == "--gpu")                { useGpu = true; }
+        else if (arg == "--vram"   && hasNext)  { useGpu = true; vramCapGB = std::strtod(argv[++i], nullptr); }
         else if (!arg.empty() && arg[0] != '-' && modelDir.empty()) { modelDir = arg; }
         else { std::cout << "unknown option: " << arg << "\n"; usage(); return 1; }
     }
@@ -281,11 +323,15 @@ int main(int argc, char** argv) {
     */
     std::string deviceLine = "CPU";
     if (useGpu) {
+        ai::OffloadPlan plan;
+        if (vramCapGB > 0.0)
+            plan.vramBudget = static_cast<size_t>(vramCapGB * 1024.0 * 1024.0 * 1024.0);
+
         const size_t footprint = model.deviceFootprint();
         std::cout << "uploading " << formatBytes(footprint) << " to the GPU" << std::endl;
 
         const clock::time_point uploadBegin = clock::now();
-        const ai::LocalModel::DeviceReport report = model.toDevice(drawBar);
+        const ai::LocalModel::DeviceReport report = model.toDevice(plan, drawBar);
         clearBar();
 
         if (!report.ok) {
@@ -297,6 +343,26 @@ int main(int argc, char** argv) {
             deviceLine = ai::gpu::deviceName() + ", " + formatBytes(report.bytes)
                        + " " + ai::quant::typeName(quantType)
                        + " in " + std::to_string(seconds).substr(0, 4) + "s";
+
+            /*
+                Say it plainly when only part of the model went across. A
+                partial offload is several times slower than a full one and
+                looks identical from the outside, which is exactly the kind
+                of thing that gets mistaken for the GPU not working at all.
+            */
+            if (report.partial) {
+                std::cout << "\nonly part of the model fits in "
+                          << formatBytes(report.budget) << " of VRAM:\n"
+                          << "  " << report.layersOnDevice << " of " << report.layersTotal
+                          << " layers on the GPU, " << (report.layersTotal - report.layersOnDevice)
+                          << " on the CPU"
+                          << (report.headOnDevice ? "" : ", output projection on the CPU") << "\n"
+                          << "  expect it to run closer to CPU speed than GPU speed.\n"
+                          << "  a smaller --q4 / --q8 would fit more of it.\n\n";
+
+                deviceLine += "  (" + std::to_string(report.layersOnDevice) + "/"
+                            + std::to_string(report.layersTotal) + " layers)";
+            }
         }
     }
 
@@ -369,15 +435,30 @@ int main(int argc, char** argv) {
         - the cache carries across turns, so a follow-up only pays for its own
           tokens rather than reprocessing the conversation
     */
-    const auto run = [&](const std::string& text) {
-        /* the wrapper tokens belong to the start of a sequence, so a
-           follow-up turn appended to a live cache must not repeat them */
-        std::vector<size_t> ids = model.tokenizer.encode(text, cache.length == 0);
+    const auto run = [&](const std::string& userText) {
+        /*
+            Rendered here rather than by the caller because both the wrapper
+            tokens and the system preamble belong to the START of a
+            sequence, and only this scope knows whether the cache is empty -
+            including after the reset below, which begins a fresh one and so
+            needs them again. Building it outside meant a reset produced a
+            sequence missing both.
+        */
+        const auto build = [&] {
+            const bool first = (cache.length == 0);
+            const std::string text = chat
+                ? model.chatPrompt(userText, false, first ? systemPrompt : std::string())
+                : userText;
+            return model.tokenizer.encode(text, first);
+        };
+
+        std::vector<size_t> ids = build();
         if (ids.empty()) return;
 
         if (cache.length + ids.size() + 8 >= context) {
             std::cout << "(context full, resetting)" << std::endl;
             cache.reset();
+            ids = build();
         }
 
         const clock::time_point prefillBegin = clock::now();
@@ -415,7 +496,7 @@ int main(int argc, char** argv) {
     };
 
     if (!oneShot.empty()) {
-        run(chat ? model.chatPrompt(oneShot) : oneShot);
+        run(oneShot);
         stats();
         return 0;
     }
@@ -436,7 +517,7 @@ int main(int argc, char** argv) {
         if (line == "/stats") { stats(); continue; }
 
         std::cout << std::endl;
-        run(chat ? model.chatPrompt(line) : line);
+        run(line);
         std::cout << std::endl;
         stats();
         std::cout << std::endl;
