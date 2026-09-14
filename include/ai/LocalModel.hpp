@@ -347,6 +347,34 @@ inline ArchSpec qwen3NextSpec() {
     return s;
 }
 
+/*
+    qwen3MoeSpec():
+    - Qwen3's attention, unchanged, with the feed forward replaced by a bank
+      of experts on every layer. A strict subset of what Qwen3-Next needs:
+      no Gated DeltaNet, no hybrid layer schedule, and - the one thing that
+      had to become optional to run it - no shared expert. The router and
+      expert tensors are named exactly as Next names them.
+    - 30B parameters of which ~3B run per token, which is what makes it the
+      model where the CPU is competitive with the card: a decode step reads
+      the eight experts it chose and not the hundred and twenty it did not
+*/
+inline ArchSpec qwen3MoeSpec() {
+    ArchSpec s = qwen3Spec();
+    s.modelType = "qwen3_moe";
+    s.mlp       = MLPKind::MoE;
+
+    s.names.router      = "model.layers.{L}.mlp.gate.weight";
+    s.names.expertGate  = "model.layers.{L}.mlp.experts.{E}.gate_proj.weight";
+    s.names.expertUp    = "model.layers.{L}.mlp.experts.{E}.up_proj.weight";
+    s.names.expertDown  = "model.layers.{L}.mlp.experts.{E}.down_proj.weight";
+    // no shared expert: sharedGate/Up/Down/Scale stay empty on purpose
+
+    s.names.gate.clear();
+    s.names.up.clear();
+    s.names.down.clear();
+    return s;
+}
+
 inline ArchSpec gpt2Spec() {
     ArchSpec s;
     s.modelType = "gpt2";
@@ -406,6 +434,7 @@ inline const std::vector<ArchSpec>& specRegistry() {
         qwen35Spec("qwen3_5"),
         qwen35Spec("qwen3_5_text"),
         qwen3NextSpec(),
+        qwen3MoeSpec(),
     };
     return all;
 }
@@ -880,6 +909,18 @@ struct LocalModel {
     ModelWeights             weights;
     Tokenizer                tokenizer;
 
+    /*
+        Whether this model's chat template uses a <think> block - read from
+        tokenizer_config.json when there is one. The vocabulary is the wrong
+        place to ask: Qwen ships one tokenizer across the family, so the
+        token exists in a coder model that was never trained to see it, and
+        handing that model an empty think block makes it end its turn on
+        the spot. templateKnown says whether the answer came from the
+        template or fell back to the vocabulary
+    */
+    bool                     templateKnown = false;
+    bool                     templateThinks = false;
+
     Weight                   embed, lmHead;
     Tensor<float>            posEmbed;                 // learned positions only
     Tensor<float>            finalNorm, finalNormBias;
@@ -1142,7 +1183,31 @@ struct LocalModel {
     }
 
 
+    /* the template is the authority on what the model expects around a
+       turn; the vocabulary only says which tokens exist */
+    void readChatTemplate(const fs::path& directory) {
+        templateKnown = templateThinks = false;
+        const fs::path config = directory / "tokenizer_config.json";
+        if (!fs::exists(config)) return;
+
+        const files::json::ParseResult parsed = files::json::parseFile(config);
+        if (!parsed.ok) return;
+
+        const std::string tmpl = parsed.value["chat_template"].asString();
+        if (tmpl.empty()) return;
+
+        templateKnown  = true;
+        templateThinks = tmpl.find("<think>") != std::string::npos;
+    }
+
+    /* true if a think block belongs in the assistant turn */
+    bool usesThinkBlock() const {
+        return templateKnown ? templateThinks : tokenizer.hasSpecial("<think>");
+    }
+
     bool loadTokenizer(const fs::path& directory) {
+        readChatTemplate(directory);
+
         if (fs::exists(directory / "tokenizer.json")) {
             if (tokenizer.loadJson(directory / "tokenizer.json")) return true;
             error = "tokenizer.json: " + tokenizer.error;
@@ -1383,8 +1448,10 @@ struct LocalModel {
             L.shared.up   = fetch(named(spec.names.sharedUp, i));
             L.shared.down = fetch(named(spec.names.sharedDown, i));
 
-            if (!L.router.valid() || !L.sharedScale.valid()
-                || !L.shared.gate.valid() || !L.shared.up.valid() || !L.shared.down.valid()) {
+            const bool wantsShared = !spec.names.sharedGate.empty();
+            const bool hasShared   = L.sharedScale.valid() && L.shared.gate.valid()
+                                  && L.shared.up.valid()   && L.shared.down.valid();
+            if (!L.router.valid() || (wantsShared && !hasShared)) {
                 error = "missing router or shared expert for layer " + std::to_string(i);
                 return false;
             }
@@ -2086,20 +2153,30 @@ struct LocalModel {
         const size_t M = cfg.moeIntermediate;
         const size_t S = cfg.sharedIntermediate;
 
-        /* ---- the shared expert, which every token pays for -------------- */
-        std::vector<float> sg(count * S), su(count * S), scale(count);
+        /*
+            ---- the shared expert, which every token pays for ----------------
+            Qwen3-Next has one; Qwen3-MoE does not. The routed experts below
+            ACCUMULATE into `out`, so when there is no shared expert to write
+            it first it has to be zeroed here, or the sum starts from whatever
+            the buffer held last
+        */
+        if (L.shared.gate.valid()) {
+            std::vector<float> sg(count * S), su(count * S), scale(count);
 
-        apply(h, L.shared.gate, sg.data(), count);
-        apply(h, L.shared.up,   su.data(), count);
-        for (size_t i = 0; i < count * S; ++i) sg[i] = activation(sg[i]) * su[i];
-        apply(sg.data(), L.shared.down, out, count);
+            apply(h, L.shared.gate, sg.data(), count);
+            apply(h, L.shared.up,   su.data(), count);
+            for (size_t i = 0; i < count * S; ++i) sg[i] = activation(sg[i]) * su[i];
+            apply(sg.data(), L.shared.down, out, count);
 
-        apply(h, L.sharedScale, scale.data(), count);
-        for (size_t t = 0; t < count; ++t) {
-            const float g = sigmoidOf(scale[t]);
-            for (size_t i = 0; i < H; ++i) out[t * H + i] *= g;
+            apply(h, L.sharedScale, scale.data(), count);
+            for (size_t t = 0; t < count; ++t) {
+                const float g = sigmoidOf(scale[t]);
+                for (size_t i = 0; i < H; ++i) out[t * H + i] *= g;
+            }
+            if (trace) trace->add(tag + "shared", out, count * H);
+        } else {
+            std::fill(out, out + count * H, 0.0f);
         }
-        if (trace) trace->add(tag + "shared", out, count * H);
 
         /* ---- route ------------------------------------------------------ */
         std::vector<float>  logits(count * E);
@@ -2424,7 +2501,7 @@ struct LocalModel {
                     emitting the text anyway just puts stray tokens in front
                     of the answer.
                 */
-                if (tokenizer.hasSpecial("<think>"))
+                if (usesThinkBlock())
                     prompt += thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
 
                 return prompt;

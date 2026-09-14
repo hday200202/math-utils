@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <mutex>
 #include <vector>
 
 #include "../../include/ai/gpu/Device.hpp"
@@ -43,6 +44,23 @@ struct Context {
     bool        ok = false;
     std::string name;
     std::string error;
+
+    /*
+        One lock around every trip to the card.
+
+        The scratch buffers below and the stream the kernels run on are
+        shared by the whole process, and the mixture-of-experts block calls
+        apply() from eight threads at once - one per chosen expert. Without
+        this, thread A stages its activations, thread B overwrites them
+        before A's kernel has read them, and the model answers in garbage
+        that happens to end its turn. The dense path never saw it because
+        it only ever calls from one thread.
+
+        Serialising costs nothing real: the card is one device, every
+        dispatch already synchronises on its own result, and the threads
+        were there for the CPU experts, which still run in parallel.
+    */
+    std::mutex  gate;
 
     size_t  allocated = 0;
     Counters stats;
@@ -371,6 +389,8 @@ void dispatch(const float* A, float* C, size_t M, size_t K, size_t N, Launch lau
     Context& ctx = Context::instance();
     if (!ctx.ok) return;
 
+    std::lock_guard<std::mutex> lock(ctx.gate);
+
     const size_t inBytes  = M * K * sizeof(float);
     const size_t outBytes = M * N * sizeof(float);
 
@@ -414,8 +434,10 @@ void dispatch(const float* A, float* C, size_t M, size_t K, size_t N, Launch lau
 
 Buffer::~Buffer() {
     if (!m_ptr) return;
+    Context& ctx = Context::instance();
+    std::lock_guard<std::mutex> lock(ctx.gate);
     (void)hipFree(m_ptr);
-    Context::instance().allocated -= m_bytes;
+    ctx.allocated -= m_bytes;
 }
 
 bool available() { return Context::instance().ok; }
@@ -440,6 +462,8 @@ size_t freeMemory() {
 BufferRef upload(const void* host, size_t bytes) {
     Context& ctx = Context::instance();
     if (!ctx.ok || bytes == 0) return nullptr;
+
+    std::lock_guard<std::mutex> lock(ctx.gate);
 
     void* device = nullptr;
     if (hipMalloc(&device, bytes) != hipSuccess) {

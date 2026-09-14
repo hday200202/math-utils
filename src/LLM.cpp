@@ -308,13 +308,51 @@ int main(int argc, char** argv) {
         std::cout << "--random: the shapes come from the checkpoint, the numbers do not.\n"
                   << "          this is a topology test, not the model.\n";
 
+    /*
+        Two memories, and with --gpu they answer different questions.
+
+        System RAM is what the LOAD needs: the checkpoint streams through
+        it whether or not a card is involved, and the peak is set by the
+        largest tensor in flight plus whatever has been narrowed so far.
+        That is the number the refusal below is about.
+
+        VRAM is what the RESIDENT weights need once they have been sent
+        across. A model can pass the first test and fail the second, in
+        which case it does not fail at all - the layers that do not fit
+        stay on the CPU - but it will be a great deal slower, and that is
+        worth saying before the 25 seconds of loading rather than after.
+    */
+    const size_t gpuFree = useGpu ? ai::gpu::freeMemory() : 0;
+
     if (onDisk && available) {
         std::cout << "weights " << formatBytes(onDisk) << " on disk";
         if (quantType != ai::quant::Type::None)
             std::cout << " -> " << formatBytes(resident) << " as "
-                      << ai::quant::typeName(quantType)
-                      << " (peak " << formatBytes(peak) << " loading)";
-        std::cout << ", available " << formatBytes(available) << std::endl;
+                      << ai::quant::typeName(quantType);
+        std::cout << std::endl;
+
+        if (gpuFree) {
+            std::cout << "  system  " << formatBytes(available) << " available, "
+                      << formatBytes(peak) << " peak while loading\n"
+                      << "  GPU     " << formatBytes(gpuFree) << " free, "
+                      << formatBytes(resident) << " to upload";
+
+            const size_t reserve = size_t(512) << 20;
+            const size_t usable  = gpuFree > reserve ? gpuFree - reserve : 0;
+            if (resident > usable) {
+                std::cout << "\n          about " << formatBytes(resident - usable)
+                          << " of that will not fit and stays on the CPU; expect it to\n"
+                          << "          run closer to CPU speed. A smaller quant may fit whole.";
+            }
+            std::cout << std::endl;
+        } else if (useGpu) {
+            std::cout << "  system  " << formatBytes(available) << " available, "
+                      << formatBytes(peak) << " peak while loading\n"
+                      << "  GPU     none found - this will run on the CPU" << std::endl;
+        } else {
+            std::cout << "  system  " << formatBytes(available) << " available, "
+                      << formatBytes(peak) << " peak while loading" << std::endl;
+        }
 
         if (peak > available) {
             std::cout << "\nrefusing to load: this needs about "
@@ -412,6 +450,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!effort.empty() && !model.usesThinkBlock())
+        std::cout << "note: --effort has no effect here. This model's chat template has no\n"
+                  << "      <think> block, so there is no scratchpad to spend it in.\n";
+
     if (context > model.cfg.maxPositions) context = model.cfg.maxPositions;
 
     /* a base model has no chat tokens, so wrapping its input in a template
@@ -420,14 +462,20 @@ int main(int argc, char** argv) {
 
     const char* normName = model.spec.norm == ai::NormKind::RMSNorm ? "RMSNorm" : "LayerNorm";
     const char* posName  = model.spec.pos  == ai::PosKind::RoPE     ? "RoPE"    : "learned";
-    const char* mlpName  = model.spec.mlp  == ai::MLPKind::SwiGLU   ? "SwiGLU"  : "GELU MLP";
+    const char* mlpName  = model.spec.mlp  == ai::MLPKind::SwiGLU   ? "SwiGLU"
+                         : model.spec.mlp  == ai::MLPKind::MoE      ? "MoE"
+                         :                                            "GELU MLP";
 
     std::cout << "\n"
               << "  architecture " << model.modelType
                                    << "  (" << normName << ", " << posName
                                    << ", " << mlpName
                                    << (model.spec.qkNorm ? ", QK-norm" : "") << ")\n"
-              << "  layers       " << model.cfg.nLayer << "\n"
+              << "  layers       " << model.cfg.nLayer << "\n";
+    if (model.cfg.isMoE())
+        std::cout << "  experts      " << model.cfg.expertsPerToken << " of "
+                  << model.cfg.numExperts << " per token\n";
+    std::cout
               << "  hidden       " << model.cfg.hidden << "\n"
               << "  heads        " << model.cfg.nHead << " query / "
                                    << model.cfg.nKVHead << " kv  (head_dim "

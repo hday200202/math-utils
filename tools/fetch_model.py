@@ -29,9 +29,15 @@ import urllib.request
 
 BASE = "https://huggingface.co"
 
-# must match the registry in include/ai/LocalModel.hpp
-SUPPORTED = {"gpt2", "llama", "mistral", "qwen2", "qwen3", "phi3"}
+# must match specRegistry() in include/ai/LocalModel.hpp. The loader prints
+# its own list on a mismatch, so a stale entry here refuses a download the
+# engine could have run - which is exactly what happened with qwen3_moe.
+SUPPORTED = {"gpt2", "llama", "mistral", "qwen2", "qwen3", "phi3",
+             "qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_moe"}
 
+# these carry a bank of experts. The loader routes them, so the presence of
+# experts is no longer a reason to refuse - but only for types that are in
+# SUPPORTED, since a new MoE family still needs its tensor names registered
 MOE_KEYS = ("num_experts", "n_routed_experts", "num_local_experts", "moe_intermediate_size")
 
 
@@ -218,8 +224,9 @@ def inspect(repo):
     text = cfg.get("text_config", cfg)
     kind = cfg.get("model_type") or text.get("model_type")
 
-    if any(k in text for k in MOE_KEYS):
-        return cfg, "mixture-of-experts (" + str(kind) + "): needs expert routing"
+    if any(k in text for k in MOE_KEYS) and kind not in SUPPORTED:
+        return cfg, ("mixture-of-experts (" + str(kind)
+                     + "): experts are routed, but this family's tensor names are not registered")
 
     layer_types = text.get("layer_types")
     if layer_types and len(set(layer_types)) > 1:
@@ -304,7 +311,24 @@ def main():
           % (human(total), len([f for f in wanted if f.endswith('.safetensors')])))
     if skipped:
         print("  skipping   %s of duplicate weights in the repo" % human(skipped))
-    print("  est speed  ~%.1f tok/s on a 51 GB/s machine" % (51.0 / max(total / 2 ** 30, 0.01)))
+    # a token reads every weight once - unless the model is an MoE, in
+    # which case it reads the experts it chose and not the ones it did not.
+    # Estimating from the total would call Qwen3-30B-A3B a 1 tok/s model
+    # when it reads a tenth of that; scale by the active fraction instead
+    text = cfg.get("text_config", cfg)
+    per_token = total
+    experts = text.get("num_experts") or text.get("n_routed_experts") or text.get("num_local_experts")
+    active = text.get("num_experts_per_tok")
+    if experts and active and experts > active:
+        H = text.get("hidden_size", 0); M = text.get("moe_intermediate_size", 0)
+        L = text.get("num_hidden_layers", 0)
+        expert_params = L * experts * 3 * H * M
+        all_params = max(total / 2, 1)              # bf16 on disk: 2 bytes each
+        dense_frac = max(0.0, 1.0 - expert_params / all_params)
+        per_token = total * (dense_frac + (1.0 - dense_frac) * active / experts)
+        print("  per token  %s of %s - %d of %d experts run"
+              % (human(per_token), human(total), active, experts))
+    print("  est speed  ~%.1f tok/s on a 51 GB/s machine" % (51.0 / max(per_token / 2 ** 30, 0.01)))
 
     if reason:
         print("\n  CANNOT RUN: " + reason)
