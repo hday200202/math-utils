@@ -5,7 +5,7 @@
 #include <mutex>
 #include <vector>
 
-#include "../../include/ai/gpu/Device.hpp"
+#include "../../include/ai/gpu/DeviceABI.h"
 
 /*
     The HIP backend. The only translation unit hipcc compiles.
@@ -62,8 +62,8 @@ struct Context {
     */
     std::mutex  gate;
 
-    size_t  allocated = 0;
-    Counters stats;
+    size_t         allocated = 0;
+    AiGpuCounters  stats{};
 
     void*  scratchIn      = nullptr;
     size_t scratchInBytes = 0;
@@ -430,105 +430,154 @@ void dispatch(const float* A, float* C, size_t M, size_t K, size_t N, Launch lau
 
 /* ========================================================================= //
     Interface
+
+    The C entry points declared in DeviceABI.h, and the only symbols this
+    translation unit exports. Everything above stays C++ and stays private
+    to this file; nothing with a mangled name crosses out.
+
+    That is what lets hipcc compile this on Windows - where it targets the
+    MSVC ABI - and MinGW g++ link against the result. The bodies are the
+    same ones the C++ interface had; only the signatures changed, from
+    Buffer& to void* and from std::string to const char*.
 // ========================================================================= */
 
-Buffer::~Buffer() {
-    if (!m_ptr) return;
-    Context& ctx = Context::instance();
-    std::lock_guard<std::mutex> lock(ctx.gate);
-    (void)hipFree(m_ptr);
-    ctx.allocated -= m_bytes;
+extern "C" {
+
+AI_GPU_ABI int aigpu_available(void) { return Context::instance().ok ? 1 : 0; }
+
+/*
+    Borrowed pointers into the context's own strings. The caller copies
+    immediately - see Device.hpp - so these only have to outlive the call,
+    and a std::string never leaves this translation unit.
+*/
+AI_GPU_ABI const char* aigpu_device_name(void) {
+    return Context::instance().name.c_str();
 }
 
-bool available() { return Context::instance().ok; }
+AI_GPU_ABI const char* aigpu_last_error(void) {
+    return Context::instance().error.c_str();
+}
 
-const std::string& deviceName() { return Context::instance().name; }
-const std::string& lastError()  { return Context::instance().error; }
+AI_GPU_ABI uint64_t aigpu_allocated_bytes(void) {
+    return static_cast<uint64_t>(Context::instance().allocated);
+}
 
-size_t allocatedBytes() { return Context::instance().allocated; }
-
-size_t totalMemory() {
+AI_GPU_ABI uint64_t aigpu_total_memory(void) {
     size_t free = 0, total = 0;
-    if (!available() || hipMemGetInfo(&free, &total) != hipSuccess) return 0;
-    return total;
+    if (!Context::instance().ok || hipMemGetInfo(&free, &total) != hipSuccess) return 0;
+    return static_cast<uint64_t>(total);
 }
 
-size_t freeMemory() {
+AI_GPU_ABI uint64_t aigpu_free_memory(void) {
     size_t free = 0, total = 0;
-    if (!available() || hipMemGetInfo(&free, &total) != hipSuccess) return 0;
-    return free;
+    if (!Context::instance().ok || hipMemGetInfo(&free, &total) != hipSuccess) return 0;
+    return static_cast<uint64_t>(free);
 }
 
-BufferRef upload(const void* host, size_t bytes) {
+AI_GPU_ABI void* aigpu_upload(const void* host, uint64_t bytes) {
     Context& ctx = Context::instance();
     if (!ctx.ok || bytes == 0) return nullptr;
 
     std::lock_guard<std::mutex> lock(ctx.gate);
 
     void* device = nullptr;
-    if (hipMalloc(&device, bytes) != hipSuccess) {
+    if (hipMalloc(&device, static_cast<size_t>(bytes)) != hipSuccess) {
         ctx.error = "out of VRAM: hipMalloc(" + std::to_string(bytes) + ") failed";
         return nullptr;
     }
 
-    if (hipMemcpy(device, host, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+    if (hipMemcpy(device, host, static_cast<size_t>(bytes),
+                  hipMemcpyHostToDevice) != hipSuccess) {
         (void)hipFree(device);
         ctx.error = "hipMemcpy host to device failed during upload";
         return nullptr;
     }
 
-    ctx.allocated += bytes;
-    return std::make_shared<Buffer>(device, bytes);
+    ctx.allocated += static_cast<size_t>(bytes);
+    return device;
 }
 
-bool download(void* host, const Buffer& source, size_t bytes) {
-    if (!available() || !source.valid()) return false;
-    return hipMemcpy(host, source.ptr(), bytes, hipMemcpyDeviceToHost) == hipSuccess;
+/*
+    Freed by the side that allocated it. The byte count comes back in so the
+    running total needs no lookup table - and because the caller's Buffer
+    already knows it.
+*/
+AI_GPU_ABI void aigpu_release(void* device, uint64_t bytes) {
+    if (!device) return;
+
+    Context& ctx = Context::instance();
+    std::lock_guard<std::mutex> lock(ctx.gate);
+    (void)hipFree(device);
+    ctx.allocated -= static_cast<size_t>(bytes);
 }
 
-void matmulNTBF16(const float* A, const Buffer& B, float* C,
-                  size_t M, size_t K, size_t N) {
-    if (!B.valid()) return;
+AI_GPU_ABI int aigpu_download(void* host, const void* device, uint64_t bytes) {
+    if (!Context::instance().ok || !device) return 0;
+    return hipMemcpy(host, device, static_cast<size_t>(bytes),
+                     hipMemcpyDeviceToHost) == hipSuccess ? 1 : 0;
+}
+
+AI_GPU_ABI void aigpu_matmul_nt_bf16(const float* a, const void* b, float* c,
+                                     uint64_t m, uint64_t k, uint64_t n) {
+    if (!b) return;
+
+    const size_t M = static_cast<size_t>(m);
+    const size_t K = static_cast<size_t>(k);
+    const size_t N = static_cast<size_t>(n);
 
     const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M));
-    const int  k = static_cast<int>(K);
-    const int  n = static_cast<int>(N);
-    const uint16_t* weights = static_cast<const uint16_t*>(B.ptr());
+    const int  kk = static_cast<int>(K);
+    const int  nn = static_cast<int>(N);
+    const uint16_t* weights = static_cast<const uint16_t*>(b);
 
-    dispatch(A, C, M, K, N, [&](float* dA, float* dC) {
+    dispatch(a, c, M, K, N, [&](float* dA, float* dC) {
         if (K % 4 == 0)
-            hipLaunchKernelGGL(gemvBF16Vec, grid, dim3(BLOCK), 0, 0, dA, weights, dC, k, n);
+            hipLaunchKernelGGL(gemvBF16Vec, grid, dim3(BLOCK),
+                               0, 0, dA, weights, dC, kk, nn);
         else
-            hipLaunchKernelGGL(gemvBF16Scalar, grid, dim3(BLOCK), 0, 0, dA, weights, dC, k, n);
+            hipLaunchKernelGGL(gemvBF16Scalar, grid, dim3(BLOCK),
+                               0, 0, dA, weights, dC, kk, nn);
     });
 }
 
-void matmulNTQ8(const float* A, const Buffer& B, const Buffer& scales, float* C,
-                size_t M, size_t K, size_t N) {
-    if (!B.valid() || !scales.valid()) return;
+AI_GPU_ABI void aigpu_matmul_nt_q8(const float* a, const void* b,
+                                   const void* scales, float* c,
+                                   uint64_t m, uint64_t k, uint64_t n) {
+    if (!b || !scales) return;
 
-    const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M));
-    const int  k = static_cast<int>(K);
-    const int  n = static_cast<int>(N);
-    const int8_t* codes = static_cast<const int8_t*>(B.ptr());
-    const float*  rows  = static_cast<const float*>(scales.ptr());
+    const size_t M = static_cast<size_t>(m);
+    const size_t K = static_cast<size_t>(k);
+    const size_t N = static_cast<size_t>(n);
 
     if (K % 32 != 0) {
         Context::instance().error = "Q8 block scales need K divisible by 32";
         return;
     }
 
-    dispatch(A, C, M, K, N, [&](float* dA, float* dC) {
+    const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M));
+    const int  kk = static_cast<int>(K);
+    const int  nn = static_cast<int>(N);
+    const int8_t* codes = static_cast<const int8_t*>(b);
+    const float*  rows  = static_cast<const float*>(scales);
+
+    dispatch(a, c, M, K, N, [&](float* dA, float* dC) {
         if (K % 4 == 0)
-            hipLaunchKernelGGL(gemvQ8Vec, grid, dim3(BLOCK), 0, 0, dA, codes, rows, dC, k, n);
+            hipLaunchKernelGGL(gemvQ8Vec, grid, dim3(BLOCK),
+                               0, 0, dA, codes, rows, dC, kk, nn);
         else
-            hipLaunchKernelGGL(gemvQ8Scalar, grid, dim3(BLOCK), 0, 0, dA, codes, rows, dC, k, n);
+            hipLaunchKernelGGL(gemvQ8Scalar, grid, dim3(BLOCK),
+                               0, 0, dA, codes, rows, dC, kk, nn);
     });
 }
 
-void matmulNTQ4(const float* A, const Buffer& B, const Buffer& scales, float* C,
-                size_t M, size_t K, size_t N) {
-    if (!B.valid() || !scales.valid()) return;
+AI_GPU_ABI void aigpu_matmul_nt_q4(const float* a, const void* b,
+                                   const void* scales, float* c,
+                                   uint64_t m, uint64_t k, uint64_t n) {
+    if (!b || !scales) return;
+
+    const size_t M = static_cast<size_t>(m);
+    const size_t K = static_cast<size_t>(k);
+    const size_t N = static_cast<size_t>(n);
 
     /* the packer refuses a partial block, so the loader keeps any matrix
        whose width is not a multiple of 32 at Q8. Nothing should reach here */
@@ -538,40 +587,53 @@ void matmulNTQ4(const float* A, const Buffer& B, const Buffer& scales, float* C,
     }
 
     const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M));
-    const int  k = static_cast<int>(K);
-    const int  n = static_cast<int>(N);
-    const uint8_t* codes = static_cast<const uint8_t*>(B.ptr());
-    const float*   rows  = static_cast<const float*>(scales.ptr());
+    const int  kk = static_cast<int>(K);
+    const int  nn = static_cast<int>(N);
+    const uint8_t* codes = static_cast<const uint8_t*>(b);
+    const float*   rows  = static_cast<const float*>(scales);
 
-    dispatch(A, C, M, K, N, [&](float* dA, float* dC) {
-        hipLaunchKernelGGL(gemvQ4, grid, dim3(BLOCK), 0, 0, dA, codes, rows, dC, k, n);
+    dispatch(a, c, M, K, N, [&](float* dA, float* dC) {
+        hipLaunchKernelGGL(gemvQ4, grid, dim3(BLOCK),
+                           0, 0, dA, codes, rows, dC, kk, nn);
     });
 }
 
-void matmulNT(const float* A, const Buffer& B, float* C,
-              size_t M, size_t K, size_t N) {
-    if (!B.valid()) return;
+AI_GPU_ABI void aigpu_matmul_nt(const float* a, const void* b, float* c,
+                                uint64_t m, uint64_t k, uint64_t n) {
+    if (!b) return;
+
+    const size_t M = static_cast<size_t>(m);
+    const size_t K = static_cast<size_t>(k);
+    const size_t N = static_cast<size_t>(n);
 
     const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M));
-    const int  k = static_cast<int>(K);
-    const int  n = static_cast<int>(N);
-    const float* weights = static_cast<const float*>(B.ptr());
+    const int  kk = static_cast<int>(K);
+    const int  nn = static_cast<int>(N);
+    const float* weights = static_cast<const float*>(b);
 
-    dispatch(A, C, M, K, N, [&](float* dA, float* dC) {
+    dispatch(a, c, M, K, N, [&](float* dA, float* dC) {
         if (K % 4 == 0)
-            hipLaunchKernelGGL(gemvF32Vec, grid, dim3(BLOCK), 0, 0, dA, weights, dC, k, n);
+            hipLaunchKernelGGL(gemvF32Vec, grid, dim3(BLOCK),
+                               0, 0, dA, weights, dC, kk, nn);
         else
-            hipLaunchKernelGGL(gemvF32Scalar, grid, dim3(BLOCK), 0, 0, dA, weights, dC, k, n);
+            hipLaunchKernelGGL(gemvF32Scalar, grid, dim3(BLOCK),
+                               0, 0, dA, weights, dC, kk, nn);
     });
 }
 
-void synchronize() {
-    if (available()) (void)hipDeviceSynchronize();
+AI_GPU_ABI void aigpu_synchronize(void) {
+    if (Context::instance().ok) (void)hipDeviceSynchronize();
 }
 
-const Counters& counters() { return Context::instance().stats; }
+AI_GPU_ABI void aigpu_counters(AiGpuCounters* out) {
+    if (out) *out = Context::instance().stats;
+}
 
-void resetCounters() { Context::instance().stats = Counters{}; }
+AI_GPU_ABI void aigpu_reset_counters(void) {
+    Context::instance().stats = AiGpuCounters{};
+}
+
+} // !extern "C"
 
 } // !namespace gpu
 } // !namespace ai

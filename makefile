@@ -2,8 +2,9 @@
 #   GPU detection
 #
 #   There is one llm binary, not two. include/ai/gpu/Device.hpp is plain
-#   C++ with no HIP types in it, so every translation unit compiles the
-#   same way everywhere and only the BACKEND differs at link time:
+#   C++ with no HIP types in it AND entirely inline, so every translation
+#   unit compiles the same way everywhere and only the BACKEND differs at
+#   link time:
 #
 #       ROCm present   src/gpu/Kernels.hip through hipcc, linked in
 #       ROCm absent    src/gpu/Stub.cpp, where available() is false
@@ -15,30 +16,82 @@
 #       make release-llm            use the GPU if this machine has one
 #       make release-llm GPU=0      no-device build even where ROCm exists
 #       make release-llm GPU_ARCH=gfx1030   a card that is not RDNA3
+#
+#   LINUX AND WINDOWS DIFFER IN ONE PLACE
+#
+#   Linux links the HIP object straight into the executable: one GCC builds
+#   both sides, so there is nothing to reconcile.
+#
+#   Windows cannot. hipcc there emits host code against the MSVC C++ ABI
+#   and the rest of this project is MinGW g++ against libstdc++; a .o from
+#   one will not link into the other. So the backend becomes a DLL and the
+#   two sides meet across the C entry points in include/ai/gpu/DeviceABI.h,
+#   which both compilers agree about. The MinGW side never sees an MSVC
+#   import library at all - it links against our DLL and nothing else.
+#
+#   Everything above the boundary is byte-for-byte the same build on both.
 # ========================================================================= #
 
-HIPCC    ?= /opt/rocm/bin/hipcc
-GPU_ARCH ?= gfx1100
-GPU      ?= auto
+ifeq ($(OS),Windows_NT)
+    PLATFORM := windows
+else
+    PLATFORM := unix
+endif
 
+GPU ?= auto
+
+ifeq ($(PLATFORM),windows)
+    # the HIP SDK puts itself on PATH; HIP_PATH is the variable it sets
+    HIPCC ?= $(firstword $(shell command -v hipcc hipcc.bat 2>/dev/null))
+else
+    HIPCC ?= /opt/rocm/bin/hipcc
+endif
+
+# -e rather than -x: on Windows hipcc is a .bat, and whether MSYS2 calls
+# that executable is not a question worth depending on. A file that exists
+# but cannot run fails loudly at the compile step instead.
 ifeq ($(GPU),auto)
-    HAVE_HIP := $(shell test -x $(HIPCC) && echo 1)
+    HAVE_HIP := $(shell test -e "$(HIPCC)" && echo 1)
 else ifeq ($(GPU),0)
     HAVE_HIP :=
 else
     HAVE_HIP := 1
 endif
 
+# ask the machine which card it has rather than making the user remember.
+# gfx1100 is RDNA3 (7900 XT/XTX); this falls back to it so a build on a
+# host with no query tool behaves exactly as it did before.
 ifeq ($(HAVE_HIP),1)
-    GPU_BACKEND = bin/obj/gpu-kernels.o
-    GPU_DEP     = bin/obj/gpu-kernels.o
-    GPU_LIBS    = -L/opt/rocm/lib -lamdhip64
-    GPU_NOTE    = with the HIP backend
+    DETECTED_ARCH := $(shell rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]*' || \
+                             hipInfo  2>/dev/null | grep -om1 'gfx[0-9a-f]*')
+endif
+GPU_ARCH ?= $(if $(DETECTED_ARCH),$(DETECTED_ARCH),gfx1100)
+
+ifeq ($(HAVE_HIP),1)
+    GPU_NOTE = with the HIP backend ($(GPU_ARCH))
+    ifeq ($(PLATFORM),windows)
+        # named per configuration rather than shared, because a DLL has to
+        # sit beside the executable that loads it
+        GPU_FLAGS   = -DAI_GPU_USE_DLL
+        GPU_LIBS    =
+        GPU_RELEASE = bin/release/gpu-kernels.dll
+        GPU_DEBUG   = bin/debug/gpu-kernels.dll
+    else
+        GPU_FLAGS   =
+        GPU_LIBS    = -L/opt/rocm/lib -lamdhip64
+        GPU_RELEASE = bin/obj/gpu-kernels.o
+        GPU_DEBUG   = bin/obj/gpu-kernels.o
+    endif
+    GPU_DEP_RELEASE = $(GPU_RELEASE)
+    GPU_DEP_DEBUG   = $(GPU_DEBUG)
 else
-    GPU_BACKEND = src/gpu/Stub.cpp
-    GPU_DEP     =
-    GPU_LIBS    =
-    GPU_NOTE    = no GPU backend on this machine
+    GPU_FLAGS       =
+    GPU_LIBS        =
+    GPU_RELEASE     = src/gpu/Stub.cpp
+    GPU_DEBUG       = src/gpu/Stub.cpp
+    GPU_DEP_RELEASE =
+    GPU_DEP_DEBUG   =
+    GPU_NOTE        = no GPU backend on this machine
 endif
 
 
@@ -196,17 +249,17 @@ release-json:
 
 
 
-debug-llm: $(GPU_DEP)
+debug-llm: $(GPU_DEP_DEBUG)
 	clear
 	mkdir -p bin/debug
 	echo "building llm debug, $(GPU_NOTE)..."
-	g++ -std=c++26 -Isrc -Iinclude -O0 -g -o bin/debug/llm src/LLM.cpp $(GPU_BACKEND) $(GPU_LIBS) -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O0 -g $(GPU_FLAGS) -o bin/debug/llm src/LLM.cpp $(GPU_DEBUG) $(GPU_LIBS) -Werror -Wall
 
-release-llm: $(GPU_DEP)
+release-llm: $(GPU_DEP_RELEASE)
 	clear
 	mkdir -p bin/release
 	echo "building llm release, $(GPU_NOTE)..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/llm src/LLM.cpp $(GPU_BACKEND) $(GPU_LIBS) -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native $(GPU_FLAGS) -o bin/release/llm src/LLM.cpp $(GPU_RELEASE) $(GPU_LIBS) -Werror -Wall
 
 # the architecture suite, deliberately on the stub: it tests the model and
 # the loader, and has no business needing ROCm to build
@@ -221,16 +274,26 @@ release-llm-test:
 #   GPU kernels
 #
 #   Only src/gpu/Kernels.hip goes through hipcc; everything else stays on
-#   g++ -std=c++26 and links the object.
+#   g++ -std=c++26.
 #
-#   GPU_ARCH must match the card. gfx1100 is RDNA3 - the 7900 XT/XTX. Ask
-#   rocminfo if unsure:  rocminfo | grep gfx
+#   GPU_ARCH is detected from rocminfo/hipInfo and falls back to gfx1100,
+#   which is RDNA3 - the 7900 XT/XTX. Override it if the guess is wrong:
+#       make release-llm GPU_ARCH=gfx1150
 # ========================================================================= #
 
-bin/obj/gpu-kernels.o: src/gpu/Kernels.hip include/ai/gpu/Device.hpp
+bin/obj/gpu-kernels.o: src/gpu/Kernels.hip include/ai/gpu/DeviceABI.h
 	mkdir -p bin/obj
 	echo "compiling HIP kernels for $(GPU_ARCH)..."
 	$(HIPCC) --offload-arch=$(GPU_ARCH) -std=c++17 -O3 -c src/gpu/Kernels.hip -o bin/obj/gpu-kernels.o
+
+# Windows: a DLL rather than an object, for the ABI reason at the top of
+# this file. One per configuration, because it has to sit beside the
+# executable that loads it.
+bin/%/gpu-kernels.dll: src/gpu/Kernels.hip include/ai/gpu/DeviceABI.h
+	mkdir -p $(dir $@)
+	echo "compiling HIP kernels for $(GPU_ARCH) into $@..."
+	$(HIPCC) --offload-arch=$(GPU_ARCH) -std=c++17 -O3 -shared \
+	         -DAI_GPU_BUILDING_DLL src/gpu/Kernels.hip -o $@
 
 # unlike llm, this one genuinely cannot be built without a card to test
 release-gpu-test:
@@ -241,9 +304,9 @@ ifneq ($(HAVE_HIP),1)
 endif
 	clear
 	mkdir -p bin/release
-	$(MAKE) bin/obj/gpu-kernels.o
+	$(MAKE) $(GPU_RELEASE)
 	echo "building gpu tests release..."
-	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native -o bin/release/gpu-testing src/gpu-testing.cpp bin/obj/gpu-kernels.o $(GPU_LIBS) -Werror -Wall
+	g++ -std=c++26 -Isrc -Iinclude -O3 -march=native $(GPU_FLAGS) -o bin/release/gpu-testing src/gpu-testing.cpp $(GPU_RELEASE) $(GPU_LIBS) -Werror -Wall
 
 gpu-test: release-gpu-test
 	./bin/release/gpu-testing
