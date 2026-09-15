@@ -127,7 +127,7 @@ private:
     std::unordered_map<Agent*, CommandBus*>     m_cmdBusRouter;
 
     std::string cmdsForAgent(Agent* agent) const {
-        std::string out;
+        std::string out = "done\n";
         for (auto& cmd : m_cmdBusRouter.at(agent)->commands())
             out += cmd;
         return out;
