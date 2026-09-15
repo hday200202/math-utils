@@ -18,7 +18,7 @@ inline static const std::string FILE_INS_SUCCESS   = "Successfully inserted in f
 enum class FilePerms { Read, Write, Append, Insert };
 
 class FileConnector : public Connector {
-public:
+private:
     FileConnector() = default;
     FileConnector(
         const std::string& label, 
@@ -34,10 +34,22 @@ public:
 
         for (auto& perm : m_perms) {
             switch (perm) {
-                case FilePerms::Read:   m_cmds.push_back(m_readCmd); break;
-                case FilePerms::Write:  m_cmds.push_back(m_writeCmd + " \"data\""); break;
-                case FilePerms::Append: m_cmds.push_back(m_appendCmd + " \"data\""); break;
-                case FilePerms::Insert: m_cmds.push_back(m_insertCmd + " [idx] " + "\"data\""); break;
+                case FilePerms::Read:   
+                    m_cmds.push_back(m_readCmd); 
+                    break;
+
+                case FilePerms::Write:  
+                    m_cmds.push_back(m_writeCmd + " \"data\""); 
+                    break;
+
+                case FilePerms::Append: 
+                    m_cmds.push_back(m_appendCmd + " \"data\""); 
+                    break;
+
+                case FilePerms::Insert: 
+                    m_cmds.push_back(m_insertCmd + " [idx] " + "\"data\""); 
+                    break;
+                    
                 default: break;
             }
         }
@@ -46,6 +58,13 @@ public:
         m_label = label;
     }
 
+    friend FileConnector* fileConnector(
+        const std::string& label,
+        const std::string& path,
+        const std::vector<FilePerms>& perms
+    );
+
+public:
     const std::vector<std::string>& commands() const override { return m_cmds; }
 
     std::string executeCmd(const std::string& cmd) override {
@@ -60,25 +79,25 @@ public:
         if (token == m_readCmd) return read();
 
         if (token == m_writeCmd) {
-            if (cmd.size() <= m_writeCmd.size() + 1) return INV_CMD;
+            if (cmd.size() <= m_writeCmd.size() + 1) return m_label + ": " + INV_CMD;
             return write(cmd.substr(m_writeCmd.size() + 1));
         }
 
         if (token == m_appendCmd) {
-            if (cmd.size() <= m_appendCmd.size() + 1) return INV_CMD;
+            if (cmd.size() <= m_appendCmd.size() + 1) return m_label + ": " + INV_CMD;
             return append(cmd.substr(m_appendCmd.size() + 1));
         }
 
-        if (cmd.size() <= m_insertCmd.size() + 1) return INV_CMD;
+        if (cmd.size() <= m_insertCmd.size() + 1) return m_label + ": " + INV_CMD;
 
         const char* begin   = cmd.data() + m_insertCmd.size() + 1;
         const char* end     = cmd.data() + cmd.size();
         uint32_t idx = 0;
         auto [ptr, ec] = std::from_chars(begin, end, idx);
 
-        if (ec != std::errc{})  return INV_CMD;
-        if (ptr == end)         return INV_CMD;
-        if (*ptr != ' ')        return INV_CMD;
+        if (ec != std::errc{})  return m_label + ": " + INV_CMD;
+        if (ptr == end)         return m_label + ": " + INV_CMD;
+        if (*ptr != ' ')        return m_label + ": " + INV_CMD;
 
         const std::string data(ptr + 1, end);
 
@@ -99,43 +118,43 @@ private:
     std::string                 m_insertCmd;
 
     std::string read() {
-        if (!hasPerm(FilePerms::Read)) return FILE_READ_FAIL;
+        if (!hasPerm(FilePerms::Read)) return m_label + ": " + FILE_READ_FAIL;
 
         files::File file; 
         file.open(m_path, files::OpenMode::Read);
-        if (!file.isOpen()) return FILE_OPEN_FAIL;
+        if (!file.isOpen()) return m_label + ": " + FILE_OPEN_FAIL;
         return file.text();
     }
 
     std::string write(const std::string& text) {
-        if (!hasPerm(FilePerms::Write)) return FILE_WRITE_FAIL;
+        if (!hasPerm(FilePerms::Write)) return m_label + ": " + FILE_WRITE_FAIL;
 
         files::File file; 
         file.open(m_path, files::OpenMode::Write);
-        if (!file.isOpen()) return FILE_OPEN_FAIL;
-        if (file.write(text)) return FILE_WRITE_SUCCESS;
-        return FILE_WRITE_FAIL;
+        if (!file.isOpen()) return m_label + ": " + FILE_OPEN_FAIL;
+        if (file.write(text)) return m_label + ": " + FILE_WRITE_SUCCESS;
+        return m_label + ": " + FILE_WRITE_FAIL;
     }
 
     std::string append(const std::string& text) {
-        if (!hasPerm(FilePerms::Append)) return FILE_APP_FAIL;
+        if (!hasPerm(FilePerms::Append)) return m_label + ": " + FILE_APP_FAIL;
 
         files::File file; 
         file.open(m_path, files::OpenMode::Append);
-        if (!file.isOpen()) return FILE_OPEN_FAIL;
-        if (file.append(text)) return FILE_APP_SUCCESS;
-        return FILE_APP_FAIL;
+        if (!file.isOpen()) return m_label + ": " + FILE_OPEN_FAIL;
+        if (file.append(text)) return m_label + ": " + FILE_APP_SUCCESS;
+        return m_label + ": " + FILE_APP_FAIL;
     }
 
     std::string insert(const std::string& text, const uint32_t idx) {
-        if (!hasPerm(FilePerms::Insert)) return FILE_INS_FAIL;
+        if (!hasPerm(FilePerms::Insert)) return m_label + ": " + FILE_INS_FAIL;
 
         files::File file;
         file.open(m_path, files::OpenMode::ReadWrite);
-        if (!file.isOpen()) return FILE_OPEN_FAIL;
-        if (file.insert(idx, text)) return FILE_INS_SUCCESS;
+        if (!file.isOpen()) return m_label + ": " + FILE_OPEN_FAIL;
+        if (file.insert(idx, text)) return m_label + ": " + FILE_INS_SUCCESS;
 
-        return FILE_INS_FAIL;
+        return m_label + ": " + FILE_INS_FAIL;
     }
 
     bool hasPerm(const FilePerms perm) {
@@ -144,5 +163,17 @@ private:
 };
 
 
+// FileConnector factory function
+FileConnector* fileConnector(
+    const std::string& label,
+    const std::string& path,
+    const std::vector<FilePerms>& perms
+) {
+    if (label.empty())  connectorError("FileConnector: ",   "Can not create a file connector with an empty label.");
+    if (path.empty())   connectorError(label + ": ",        "Can not create a file connector with no specified path.");
+    if (perms.empty())  connectorError(label + ": ",        "Can not create a file connector with no permissions.");
+
+    return new FileConnector(label, path, perms); 
+}
 
 }
