@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include "Connector.hpp"
 
 namespace omnibot {
@@ -12,8 +14,10 @@ private:
         const std::vector<Connector*>& connectors
     ) : m_name(name) {
         for (auto* c : connectors) {
-            for (const auto& cmd : c->commands())
-                m_cmdRouter[extractFirstToken(cmd)] = c;
+            /* route on the NAME. commands() is the json example an agent is
+               shown; names() is what actually arrives in cmd["cmd"] */
+            for (const auto& name : c->names())
+                m_cmdRouter[name] = c;
             m_connectors.emplace_back(c);
         }
     }
@@ -25,10 +29,28 @@ private:
     );
 
 public:
-    std::string executeCmd(const std::string& cmd) {
-        auto it = m_cmdRouter.find(extractFirstToken(cmd));
-        if (it == m_cmdRouter.end() || !it->second) return m_name + ": " + INV_CMD;
+    files::json::Value executeCmd(const files::json::Value& cmd) {
+        using namespace files;
+
+        const auto it = m_cmdRouter.find(cmd["cmd"].asString());
+        if (it == m_cmdRouter.end() || !it->second)
+            return json::jobject({
+                { "cmd",    json::jstr(cmd["cmd"].asString()) },
+                { "ok",     json::jbool(false) },
+                { "result", json::jstr(m_name + ": " + INV_CMD) }
+            });
+
         return it->second->executeCmd(cmd);
+    }
+
+
+    /* the bare names of everything reachable through this interface */
+    std::vector<std::string> names() const {
+        std::vector<std::string> out;
+        for (const auto& c : m_connectors)
+            for (const auto& n : c->names())
+                out.push_back(n);
+        return out;
     }
 
     const std::vector<std::string> commands() const {
@@ -48,10 +70,10 @@ private:
 };
 
 
-inline void interfaceError(
+[[noreturn]] inline void interfaceError(
     const std::string& interface,
     const std::string& info
-) { std::cerr << interface << ": " << info << std::endl; }
+) { throw Error(interface, info); }
 
 
 // Interface factory function

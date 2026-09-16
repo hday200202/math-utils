@@ -310,3 +310,24 @@ endif
 
 gpu-test: release-gpu-test
 	./bin/release/gpu-testing
+
+# ========================================================================= #
+#   OMNI-BOTS EXAMPLES
+#
+#   CPU-only: the agent stack talks to a model through llm::LLM, which needs
+#   the gpu ABI resolved. Stub.cpp satisfies it without a card.
+# ========================================================================= #
+
+notes-agent:
+	clear
+	mkdir -p bin/release
+	echo "building notes-agent example..."
+	g++ -std=c++26 -Iomni-bots -O2 -o bin/release/notes-agent \
+		omni-bots/examples/notes-agent.cpp omni-bots/ai/gpu/Stub.cpp -Werror -Wall
+
+watch-agent:
+	clear
+	mkdir -p bin/release
+	echo "building watch-agent example..."
+	g++ -std=c++26 -Iomni-bots -O2 -o bin/release/watch-agent \
+		omni-bots/examples/watch-agent.cpp omni-bots/ai/gpu/Stub.cpp -Werror -Wall

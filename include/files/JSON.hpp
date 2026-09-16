@@ -369,6 +369,38 @@ struct Parser {
       by binary payload must be sliced to its declared length before it gets
       here, or the leftover bytes are reported as an error
 */
+
+/* ========================================================================= //
+    Building
+
+    The parser above only ever reads. Anything that needs to PRODUCE json -
+    a connector reporting a result, say - would otherwise set .type and push
+    into .object by hand at every site, and forgetting the .type line is
+    silent: the value looks empty rather than wrong.
+// ========================================================================= */
+
+inline Value jnull() { return Value(); }
+
+inline Value jstr(std::string s) {
+    Value v; v.type = Type::String; v.string = std::move(s); return v;
+}
+
+inline Value jnum(double d) {
+    Value v; v.type = Type::Number; v.number = d; return v;
+}
+
+inline Value jbool(bool b) {
+    Value v; v.type = Type::Bool; v.boolean = b; return v;
+}
+
+inline Value jobject(std::initializer_list<Member> members) {
+    Value v; v.type = Type::Object; v.object = members; return v;
+}
+
+inline Value jarray(std::initializer_list<Value> items) {
+    Value v; v.type = Type::Array; v.array = items; return v;
+}
+
 inline ParseResult parse(std::string_view text) {
     ParseResult result;
 
