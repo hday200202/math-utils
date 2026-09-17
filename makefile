@@ -38,6 +38,13 @@ else
     PLATFORM := unix
 endif
 
+# WinHTTP on windows, libcurl elsewhere - see omni-bots/utils/Http.hpp
+ifeq ($(PLATFORM),windows)
+    HTTP_LIB := -lwinhttp
+else
+    HTTP_LIB := -lcurl
+endif
+
 GPU ?= auto
 
 ifeq ($(PLATFORM),windows)
@@ -323,11 +330,11 @@ notes-agent:
 	mkdir -p bin/release
 	echo "building notes-agent example..."
 	g++ -std=c++26 -Iomni-bots -O2 -o bin/release/notes-agent \
-		omni-bots/examples/notes-agent.cpp omni-bots/ai/gpu/Stub.cpp -Werror -Wall
+		omni-bots/examples/notes-agent.cpp omni-bots/ai/gpu/Stub.cpp $(HTTP_LIB) -Werror -Wall
 
 watch-agent:
 	clear
 	mkdir -p bin/release
 	echo "building watch-agent example..."
 	g++ -std=c++26 -Iomni-bots -O2 -o bin/release/watch-agent \
-		omni-bots/examples/watch-agent.cpp omni-bots/ai/gpu/Stub.cpp -Werror -Wall
+		omni-bots/examples/watch-agent.cpp omni-bots/ai/gpu/Stub.cpp $(HTTP_LIB) -Werror -Wall
