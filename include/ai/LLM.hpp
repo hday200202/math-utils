@@ -204,7 +204,7 @@ public:
             const bool first = (m_turns == 0);
             const std::string text = m_model->hasChatTemplate()
                 ? m_model->chatPrompt(input, m_options.thinking,
-                                      first ? m_options.system : std::string())
+                                      first ? m_options.system : std::string(), first)
                 : input;
             return m_model->tokenizer.encode(text, first);
         };

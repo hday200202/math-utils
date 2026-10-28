@@ -6,6 +6,8 @@
 #include <optional>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -41,12 +43,15 @@
     matmuls that take milliseconds. They cost nothing.
 
     Covered: gpt2, llama, mistral, qwen2, qwen3, phi3, and anything else that
-    is a dense decoder with the same parts.
+    is a dense decoder with the same parts. Beyond those, the newer machines
+    that are not just different settings each get their own mixer or block:
+    Gated DeltaNet and mixture-of-experts for qwen3_5 / qwen3_next / qwen3_moe,
+    and for glm5_next (GLM-5.3-Flash) Kimi Delta Attention, multi-head latent
+    attention with a sparse indexer, and hyper-connections that widen the
+    residual stream into several.
 
-    NOT covered, deliberately: mixture-of-experts routing, linear or hybrid
-    attention, state-space blocks, and multimodal towers. Those are different
-    machines, not different settings, and pretending otherwise is how an
-    abstraction rots.
+    NOT covered: state-space blocks, and multimodal towers - a multimodal
+    checkpoint loads as its text model, with the vision weights read past.
 */
 
 namespace ai {
@@ -60,8 +65,13 @@ namespace ai {
     in every layer; the qwen3_5 family alternates, with three linear-attention
     layers for every full-attention one. The choice is per LAYER, not per
     model, so it lives in the config rather than the spec.
+
+    GLM-5.3 alternates too, between two mixers neither of the others has:
+    KimiDelta is the delta rule again with the decay per CHANNEL rather than
+    per head, and LatentAttention is softmax attention whose keys and values
+    are both decompressed from one small shared latent per token.
 */
-enum class MixerKind    { Attention, GatedDeltaNet };
+enum class MixerKind    { Attention, GatedDeltaNet, KimiDelta, LatentAttention };
 
 enum class NormKind     { LayerNorm, RMSNorm };
 enum class PosKind      { Learned, RoPE };
@@ -107,6 +117,24 @@ struct NameMap {
     std::string expertGate, expertUp, expertDown;
     std::string sharedGate, sharedUp, sharedDown;
     std::string sharedScale;                   // [1, hidden], gates the shared expert
+    std::string routerBias;                    // added to the scores when choosing only
+
+    /* Kimi Delta Attention: q, k and v each with their own short convolution,
+       and low-rank projections for the forget gate (f) and output gate (g).
+       linB, linALog, linDtBias, linNorm and linOut are shared with the above */
+    std::string linQ, linK, linV, linConvQ, linConvK, linConvV;
+    std::string linFA, linFB, linGA, linGB;
+
+    /* Multi-head latent attention */
+    std::string mlaQA, mlaQANorm, mlaQB;       // query, through a low-rank bottleneck
+    std::string mlaKVA, mlaKVANorm, mlaKVB;    // the shared latent, and its expansion
+
+    /* the sparse-attention indexer that picks which keys a query may see */
+    std::string idxQB, idxK, idxKNorm, idxKNormBias, idxWeights, idxGate, idxApe;
+
+    /* hyper-connections, one set in front of each half of a layer */
+    std::string hcAttnFn, hcAttnBase, hcAttnScale;
+    std::string hcFfnFn, hcFfnBase, hcFfnScale;
 };
 
 
@@ -168,6 +196,14 @@ struct ArchSpec {
         blocks, so they have to be de-interleaved rather than simply sliced.
     */
     bool         linFusedQKVZ = false;
+
+    /*
+        Which mixer config.json's layer_types means. "linear_attention" is
+        Gated DeltaNet to Qwen and Kimi Delta Attention to GLM, and every
+        other entry is whichever softmax attention the architecture has
+    */
+    MixerKind    linearMixer    = MixerKind::GatedDeltaNet;
+    MixerKind    attentionMixer = MixerKind::Attention;
 
     /* some tensor names sit under model.language_model. rather than model. */
     std::vector<std::string> prefixCandidates;
@@ -375,6 +411,90 @@ inline ArchSpec qwen3MoeSpec() {
     return s;
 }
 
+/*
+    glm5NextSpec():
+    - GLM-5.3-Flash. Three of every four layers are Kimi Delta Attention and
+      the fourth is multi-head latent attention, sparse past a couple of
+      thousand tokens. After the first three layers the feed forward is 288
+      experts routed by sigmoid rather than softmax, plus one shared expert.
+    - the residual stream is four streams wide. Each half of a layer
+      collapses them into one input and spreads its output back across
+      them, through weights it computes from the streams themselves - see
+      hcCollapse.
+    - it is multimodal, so the text tower sits under model.language_model.
+      and the vision tower under model.visual. is never read. The extra
+      layer past num_hidden_layers is a speculative-decoding head, also
+      read past
+*/
+inline ArchSpec glm5NextSpec(const std::string& type) {
+    ArchSpec s = llamaFamily(type);
+    s.modelType      = type;
+    s.mlp            = MLPKind::MoE;
+    s.linearMixer    = MixerKind::KimiDelta;
+    s.attentionMixer = MixerKind::LatentAttention;
+    s.prefixCandidates = {"model.language_model.", "model."};
+    s.skipPrefixes     = {"model.visual."};
+
+    const std::string A = "model.layers.{L}.self_attn.";
+
+    s.names.q.clear();
+    s.names.k.clear();
+    s.names.v.clear();
+    s.names.o = A + "o_proj.weight";
+
+    s.names.linQ      = A + "q_proj.weight";
+    s.names.linK      = A + "k_proj.weight";
+    s.names.linV      = A + "v_proj.weight";
+    s.names.linConvQ  = A + "q_conv1d.weight";
+    s.names.linConvK  = A + "k_conv1d.weight";
+    s.names.linConvV  = A + "v_conv1d.weight";
+    s.names.linFA     = A + "f_a_proj.weight";
+    s.names.linFB     = A + "f_b_proj.weight";
+    s.names.linGA     = A + "g_a_proj.weight";
+    s.names.linGB     = A + "g_b_proj.weight";
+    s.names.linB      = A + "b_proj.weight";
+    s.names.linALog   = A + "A_log";
+    s.names.linDtBias = A + "dt_bias";
+    s.names.linNorm   = A + "o_norm.weight";
+    s.names.linOut    = A + "o_proj.weight";
+
+    s.names.mlaQA      = A + "q_a_proj.weight";
+    s.names.mlaQANorm  = A + "q_a_layernorm.weight";
+    s.names.mlaQB      = A + "q_b_proj.weight";
+    s.names.mlaKVA     = A + "kv_a_proj_with_mqa.weight";
+    s.names.mlaKVANorm = A + "kv_a_layernorm.weight";
+    s.names.mlaKVB     = A + "kv_b_proj.weight";
+
+    s.names.idxQB        = A + "indexer.wq_b.weight";
+    s.names.idxK         = A + "indexer.wk.weight";
+    s.names.idxKNorm     = A + "indexer.k_norm.weight";
+    s.names.idxKNormBias = A + "indexer.k_norm.bias";
+    s.names.idxWeights   = A + "indexer.weights_proj.weight";
+    s.names.idxGate      = A + "indexer.index_kpool_compress_gate";
+    s.names.idxApe       = A + "indexer.index_kpool_compress_ape";
+
+    s.names.hcAttnFn    = "model.layers.{L}.hc_attn_fn";
+    s.names.hcAttnBase  = "model.layers.{L}.hc_attn_base";
+    s.names.hcAttnScale = "model.layers.{L}.hc_attn_scale";
+    s.names.hcFfnFn     = "model.layers.{L}.hc_ffn_fn";
+    s.names.hcFfnBase   = "model.layers.{L}.hc_ffn_base";
+    s.names.hcFfnScale  = "model.layers.{L}.hc_ffn_scale";
+
+    /* the first few layers keep a dense feed forward under the llama names,
+       so gate/up/down are kept; the rest are experts */
+    s.names.router      = "model.layers.{L}.mlp.gate.weight";
+    s.names.routerBias  = "model.layers.{L}.mlp.gate.e_score_correction_bias";
+    s.names.expertGate  = "model.layers.{L}.mlp.experts.{E}.gate_proj.weight";
+    s.names.expertUp    = "model.layers.{L}.mlp.experts.{E}.up_proj.weight";
+    s.names.expertDown  = "model.layers.{L}.mlp.experts.{E}.down_proj.weight";
+    s.names.sharedGate  = "model.layers.{L}.mlp.shared_experts.gate_proj.weight";
+    s.names.sharedUp    = "model.layers.{L}.mlp.shared_experts.up_proj.weight";
+    s.names.sharedDown  = "model.layers.{L}.mlp.shared_experts.down_proj.weight";
+    // no sharedScale: the shared expert's output is added in ungated
+
+    return s;
+}
+
 inline ArchSpec gpt2Spec() {
     ArchSpec s;
     s.modelType = "gpt2";
@@ -435,6 +555,8 @@ inline const std::vector<ArchSpec>& specRegistry() {
         qwen35Spec("qwen3_5_text"),
         qwen3NextSpec(),
         qwen3MoeSpec(),
+        glm5NextSpec("glm5_next"),
+        glm5NextSpec("glm5_next_text"),
     };
     return all;
 }
@@ -442,6 +564,27 @@ inline const std::vector<ArchSpec>& specRegistry() {
 inline const ArchSpec* specFor(const std::string& modelType) {
     for (const ArchSpec& s : specRegistry()) if (s.modelType == modelType) return &s;
     return nullptr;
+}
+
+/*
+    skippedPrefixes(spec, text):
+    - the spec's own list, plus any speculative-decoding layers stacked past
+      num_hidden_layers. DeepSeek-style checkpoints number those as ordinary
+      layers - GLM-5.3's is layers.45 - so they cannot be named in advance,
+      only counted from the config. Both prefixes are listed because which
+      one the file uses is not known until it has been opened
+*/
+inline std::vector<std::string> skippedPrefixes(const ArchSpec& spec,
+                                                const files::json::Value& text) {
+    std::vector<std::string> out = spec.skipPrefixes;
+
+    const size_t layers = text["num_hidden_layers"].asSize(0);
+    const size_t extra  = text["num_nextn_predict_layers"].asSize(0);
+    for (size_t i = layers; layers > 0 && i < layers + extra; ++i)
+        for (const char* p : {"model.layers.", "model.language_model.layers."})
+            out.push_back(std::string(p) + std::to_string(i) + ".");
+
+    return out;
 }
 
 
@@ -478,6 +621,56 @@ struct LocalConfig {
     size_t moeIntermediate = 0, sharedIntermediate = 0;
     bool   normTopK = true;
 
+    /*
+        DeepSeek-style routing, which GLM uses: each expert's score is a
+        sigmoid rather than a share of a softmax, a learned bias decides
+        which experts are CHOSEN without entering the weights they get, and
+        the chosen weights are scaled up by a constant afterwards. Groups
+        let the choice be confined to the best few blocks of experts first;
+        one group is the same as no grouping at all
+    */
+    bool   sigmoidRouter = false;
+    float  routedScaling = 1.0f;
+    size_t expertGroups = 1, groupsPerToken = 1;
+
+    /* layers that keep a dense feed forward in an otherwise-MoE model */
+    std::vector<bool> denseFFN;
+
+    /* SwiGLU inputs clamped to this, 0 meaning not at all */
+    float  swigluLimit = 0.0f;
+
+    /*
+        Kimi Delta Attention reuses the Gated DeltaNet sizes above, with
+        keys and values the same width. The forget gate is bounded below:
+        decay = exp(lower * sigmoid(...)), so a channel can never forget
+        faster than e^lower per token
+    */
+    bool   linSafeGate = false;
+    float  linLowerBound = -5.0f;
+
+    /*
+        Multi-head latent attention. Every head's key and value are expanded
+        out of one kvLoraRank-wide latent per token, and it is the latent
+        that is cached - 512 floats a token where ordinary attention would
+        keep 64 heads x 512
+    */
+    size_t qLoraRank = 0, kvLoraRank = 0;
+    size_t qkNopeDim = 0, qkRopeDim = 0, vHeadDim = 0;
+
+    /*
+        The sparse-attention indexer: past indexTopK keys, a query attends
+        only to those it scores highest. Keys are scored in pools of
+        indexKPool at a time, and indexTail adds the unfinished pool at the
+        end whatever it scores
+    */
+    size_t indexHeads = 0, indexHeadDim = 0, indexTopK = 0, indexKPool = 1;
+    bool   indexTail = true;
+    std::vector<bool> indexShared;      // per layer: reuse the last full one's choice
+
+    /* hyper-connections: how many residual streams, 1 meaning the usual one */
+    size_t hcMult = 1, hcIters = 20;
+    float  hcEps = 1e-6f;
+
     std::vector<MixerKind> mixers;      // one per layer
 
     size_t linKeyWidth()   const { return linKeyHeads * linKeyDim; }
@@ -487,8 +680,20 @@ struct LocalConfig {
 
     bool isMoE() const { return numExperts > 0 && expertsPerToken > 0; }
 
+    bool denseLayer(size_t layer) const {
+        return layer < denseFFN.size() && denseFFN[layer];
+    }
+
+    size_t streams() const { return hcMult > 1 ? hcMult : 1; }
+
     bool hasLinearLayers() const {
-        for (MixerKind m : mixers) if (m == MixerKind::GatedDeltaNet) return true;
+        for (MixerKind m : mixers)
+            if (m == MixerKind::GatedDeltaNet || m == MixerKind::KimiDelta) return true;
+        return false;
+    }
+
+    bool hasLatentLayers() const {
+        for (MixerKind m : mixers) if (m == MixerKind::LatentAttention) return true;
         return false;
     }
     size_t rotaryDims() const {
@@ -542,20 +747,76 @@ struct LocalConfig {
         linValueDim   = c["linear_value_head_dim"].asSize(0);
         convKernel    = c["linear_conv_kernel_dim"].asSize(0);
 
-        numExperts         = c["num_experts"].asSize(0);
+        /* Qwen says num_experts, DeepSeek and GLM say n_routed_experts */
+        numExperts         = c["num_experts"].asSize(c["n_routed_experts"].asSize(0));
         expertsPerToken    = c["num_experts_per_tok"].asSize(0);
         moeIntermediate    = c["moe_intermediate_size"].asSize(0);
         sharedIntermediate = c["shared_expert_intermediate_size"].asSize(0);
         normTopK           = c["norm_topk_prob"].asBool(true);
 
+        if (sharedIntermediate == 0)
+            sharedIntermediate = moeIntermediate * c["n_shared_experts"].asSize(0);
+
+        sigmoidRouter  = c["scoring_func"].asString() == "sigmoid";
+        routedScaling  = static_cast<float>(c["routed_scaling_factor"].asDouble(1.0));
+        expertGroups   = std::max<size_t>(1, c["n_group"].asSize(1));
+        groupsPerToken = std::max<size_t>(1, c["topk_group"].asSize(1));
+        swigluLimit    = static_cast<float>(c["swiglu_limit"].asDouble(0.0));
+
+        /* which layers stay dense: a list when there is one, otherwise the
+           first first_k_dense_replace of them */
+        denseFFN.assign(nLayer, false);
+        const files::json::Value& mlpTypes = c["mlp_layer_types"];
+        if (mlpTypes.isArray()) {
+            for (size_t i = 0; i < mlpTypes.size() && i < nLayer; ++i)
+                denseFFN[i] = mlpTypes[i].asString() == "dense";
+        } else {
+            const size_t firstDense = c["first_k_dense_replace"].asSize(0);
+            for (size_t i = 0; i < firstDense && i < nLayer; ++i) denseFFN[i] = true;
+        }
+
+        /* GLM nests its linear-attention sizes in an object of their own */
+        const files::json::Value& lin = c["linear_attn_config"];
+        if (lin.isObject()) {
+            linKeyHeads = linValueHeads = lin["num_heads"].asSize(0);
+            linKeyDim   = linValueDim   = lin["head_dim"].asSize(0);
+            convKernel  = lin["short_conv_kernel_size"].asSize(0);
+
+            const files::json::Value& lower = lin["gate_lower_bound"];
+            linSafeGate = lower.isNumber() || lin["safe_gate"].asBool(true);
+            linLowerBound = static_cast<float>(lower.asDouble(-5.0));
+        }
+
+        qLoraRank  = c["q_lora_rank"].asSize(0);
+        kvLoraRank = c["kv_lora_rank"].asSize(0);
+        qkNopeDim  = c["qk_nope_head_dim"].asSize(0);
+        qkRopeDim  = c["qk_rope_head_dim"].asSize(0);
+        vHeadDim   = c["v_head_dim"].asSize(0);
+
+        indexHeads   = c["index_n_heads"].asSize(0);
+        indexHeadDim = c["index_head_dim"].asSize(0);
+        indexTopK    = c["index_topk"].asSize(0);
+        indexKPool   = std::max<size_t>(1, c["index_kpool"].asSize(1));
+        indexTail    = c["index_kpool_always_select_tail"].asBool(true);
+
+        indexShared.assign(nLayer, false);
+        const files::json::Value& idxTypes = c["indexer_types"];
+        for (size_t i = 0; idxTypes.isArray() && i < idxTypes.size() && i < nLayer; ++i)
+            indexShared[i] = idxTypes[i].asString() == "shared";
+
+        hcMult  = c["mhc"].asBool(true) ? std::max<size_t>(1, c["hc_mult"].asSize(1)) : 1;
+        hcIters = std::max<size_t>(1, c["hc_sinkhorn_iters"].asSize(20));
+        hcEps   = static_cast<float>(c["hc_eps"].asDouble(1e-6));
+
         /* layer_types names the mixer for each layer; absent means all
-           softmax attention, which is every architecture before this one */
-        mixers.assign(nLayer, MixerKind::Attention);
+           softmax attention, which is every architecture before this one.
+           What "linear" and "not linear" mean is the spec's to say */
+        mixers.assign(nLayer, spec.attentionMixer);
         const files::json::Value& types = c["layer_types"];
         if (types.isArray()) {
             for (size_t i = 0; i < types.size() && i < nLayer; ++i)
                 if (types[i].asString() == "linear_attention")
-                    mixers[i] = MixerKind::GatedDeltaNet;
+                    mixers[i] = spec.linearMixer;
         } else {
             /*
                 qwen3_next says the same thing as a stride instead of a list:
@@ -566,7 +827,19 @@ struct LocalConfig {
             const size_t interval = c["full_attention_interval"].asSize(0);
             if (interval > 1)
                 for (size_t i = 0; i < nLayer; ++i)
-                    if ((i + 1) % interval != 0) mixers[i] = MixerKind::GatedDeltaNet;
+                    if ((i + 1) % interval != 0) mixers[i] = spec.linearMixer;
+        }
+
+        /*
+            A latent-attention head is as wide as its expanded key, which is
+            not what head_dim says - GLM sets that to the RoPE width, which
+            is zero. Nothing reads headDim on these layers, but the summary
+            and the checks below should see the real figure
+        */
+        if (hasLatentLayers()) {
+            headDim = qkNopeDim + qkRopeDim;
+            if (qLoraRank == 0 || kvLoraRank == 0 || qkNopeDim == 0 || vHeadDim == 0)
+                return false;
         }
 
         if (isMoE() && (moeIntermediate == 0 || expertsPerToken > numExperts))
@@ -618,6 +891,7 @@ struct Weight {
     Tensor<float>       f32;
     Tensor<uint16_t>    bf16;
     quant::QuantTensor  q;
+    quant::Fp8Tensor    f8;               // FP8 codes aliasing the file, with tile scales
     Tensor<float>       bias;             // empty when the model has none
 
     /*
@@ -632,10 +906,11 @@ struct Weight {
     size_t outDim = 0, inDim = 0;
 
     bool valid() const {
-        return f32.storage != nullptr || bf16.storage != nullptr || q.valid();
+        return f32.storage != nullptr || bf16.storage != nullptr || q.valid() || f8.valid();
     }
     bool isBF16() const { return bf16.storage != nullptr; }
     bool isQuant() const { return q.valid(); }
+    bool isFP8() const { return f8.valid(); }
     bool hasBias() const { return bias.storage != nullptr; }
     bool onDevice() const { return devType != DevDType::None && dev && dev->valid(); }
 
@@ -648,8 +923,13 @@ struct Weight {
         return q.outDim * q.blocksPerRow() * sizeof(float);
     }
 
-    /* the contiguous block a device copy would be made from */
+    /*
+        the contiguous block a device copy would be made from. There are no
+        FP8 kernels on the card, so an FP8 weight offers none and stays on
+        the CPU - quantise with --q8 / --q4 to put those layers on the GPU
+    */
     const void* hostBytes() const {
+        if (isFP8())   return nullptr;
         if (isQuant()) return q.quants.get();
         if (isBF16())  return bf16.isContiguous() ? bf16.ptr : nullptr;
         if (f32.storage) return f32.isContiguous() ? f32.ptr : nullptr;
@@ -700,6 +980,8 @@ inline void apply(const float* x, const Weight& W, float* out, size_t rows,
 
     if (W.isQuant())
         kernels::matmulNTQuant(x, W.q, out, rows, W.inDim, W.outDim, threaded);
+    else if (W.isFP8())
+        kernels::matmulNTFP8(x, W.f8, out, rows, W.inDim, W.outDim, threaded);
     else if (W.isBF16())
         kernels::matmulNTBF16(x, W.bf16.ptr, out, rows, W.inDim, W.outDim, threaded);
     else if (W.hasBias())
@@ -708,7 +990,7 @@ inline void apply(const float* x, const Weight& W, float* out, size_t rows,
         kernels::matmulNT(x, W.f32.ptr, out, rows, W.inDim, W.outDim, threaded);
 
     // only the plain float kernel folds the bias in, so add it otherwise
-    if ((W.isBF16() || W.isQuant()) && W.hasBias())
+    if ((W.isBF16() || W.isQuant() || W.isFP8()) && W.hasBias())
         for (size_t r = 0; r < rows; ++r)
             for (size_t j = 0; j < W.outDim; ++j)
                 out[r * W.outDim + j] += W.bias.ptr[j];
@@ -718,6 +1000,20 @@ inline void apply(const float* x, const Weight& W, float* out, size_t rows,
 /* one SwiGLU feed forward: the shape of both a dense MLP and every expert */
 struct Expert {
     Weight gate, up, down;
+};
+
+/*
+    HyperConnection:
+    - the weights that turn several residual streams into one block input
+      and spread the block's output back across them. fn projects all the
+      streams together onto (2 + S) * S numbers per token - S to collapse
+      with, S to expand with, S*S to mix the streams among themselves - and
+      base and scale are the bias and the three per-kind gains
+*/
+struct HyperConnection {
+    Weight        fn;               // [(2 + S) * S, S * hidden]
+    Tensor<float> base;             // [(2 + S) * S]
+    Tensor<float> scale;            // [3]
 };
 
 
@@ -740,9 +1036,44 @@ struct LocalLayer {
         actually sits: 512 experts a layer, of which ten run per token
     */
     Weight              router;         // [numExperts, hidden]
+    Tensor<float>       routerBias;     // [numExperts], sways the choice only
     Weight              sharedScale;    // [1, hidden], gates the shared expert
     Expert              shared;
     std::vector<Expert> experts;
+    bool                moe = false;    // false on the dense layers of an MoE model
+
+    /* Kimi Delta Attention: linB, linALog, linDtBias, linNorm, linOut above
+       mean the same things here, and linConv holds q, k and v's kernels
+       stacked in that order */
+    Weight        linQ, linK, linV, linFA, linFB, linGA, linGB;
+
+    /*
+        Multi-head latent attention. kv_b_proj is held as float because it is
+        never applied as a matmul: each head's slice of it is folded into the
+        query on one side and the output on the other, which is what lets the
+        cache hold the latent rather than every head's key and value
+    */
+    Weight        mlaQA, mlaQB, mlaKVA;
+    Tensor<float> mlaQANorm, mlaKVANorm;
+    Tensor<float> mlaKVB;           // [heads * (nope + v), kvLoraRank]
+
+    /* the indexer, on the latent-attention layers that run their own */
+    Weight        idxQB, idxK, idxWeights, idxGate;
+    Tensor<float> idxKNorm, idxKNormBias, idxApe;
+
+    HyperConnection hcAttn, hcFfn;
+};
+
+
+/*
+    KeySelection:
+    - which earlier positions one query may attend to. dense means all of
+      them, which is every query until the context outgrows what the
+      indexer is allowed to keep
+*/
+struct KeySelection {
+    bool                  dense = true;
+    std::vector<uint32_t> keys;     // sorted, when not dense
 };
 
 
@@ -782,6 +1113,13 @@ struct LocalCache {
     std::vector<std::vector<float>> recurrent;   // [layer][vHead * kDim * vDim]
     std::vector<std::vector<float>> convWindow;  // [layer][(kernel-1) * convWidth]
 
+    /*
+        A latent-attention layer keeps its latents in `keys` and nothing in
+        `values`. Its indexer keeps a small key and gate per token, and one
+        pooled key per complete pool of them, built once when the pool fills
+    */
+    std::vector<std::vector<float>> indexKeys, indexGates, poolKeys;
+
     size_t length = 0, capacity = 0;
 
     void resize(const LocalConfig& cfg, size_t maxSeq) {
@@ -792,11 +1130,21 @@ struct LocalCache {
         values.assign(cfg.nLayer, {});
         recurrent.assign(cfg.nLayer, {});
         convWindow.assign(cfg.nLayer, {});
+        indexKeys.assign(cfg.nLayer, {});
+        indexGates.assign(cfg.nLayer, {});
+        poolKeys.assign(cfg.nLayer, {});
 
         for (size_t l = 0; l < cfg.nLayer; ++l) {
-            if (cfg.mixers[l] == MixerKind::GatedDeltaNet) {
+            if (cfg.mixers[l] == MixerKind::GatedDeltaNet || cfg.mixers[l] == MixerKind::KimiDelta) {
                 recurrent[l].assign(cfg.linValueHeads * cfg.linKeyDim * cfg.linValueDim, 0.0f);
                 convWindow[l].assign((cfg.convKernel - 1) * cfg.linConvWidth(), 0.0f);
+            } else if (cfg.mixers[l] == MixerKind::LatentAttention) {
+                keys[l].assign(maxSeq * cfg.kvLoraRank, 0.0f);
+                if (cfg.indexHeads > 0) {
+                    indexKeys[l].assign(maxSeq * cfg.indexHeadDim, 0.0f);
+                    indexGates[l].assign(maxSeq * cfg.indexHeadDim, 0.0f);
+                    poolKeys[l].assign((maxSeq / cfg.indexKPool + 1) * cfg.indexHeadDim, 0.0f);
+                }
             } else {
                 keys[l].assign(maxSeq * cfg.kvWidth(), 0.0f);
                 values[l].assign(maxSeq * cfg.kvWidth(), 0.0f);
@@ -979,7 +1327,14 @@ struct LocalModel {
             const bool isDecay = name.find("A_log") != std::string::npos;
 
             if (info.shape.size() < 2 && !isDecay) {
+                /* a norm's bias is still a bias, and a hyper-connection's
+                   three gains start at one like the reference's do */
+                const bool isBias = name.size() >= 5 && name.compare(name.size() - 5, 5, ".bias") == 0;
+                const bool isGain = name.find("hc_") != std::string::npos
+                                 && name.find("_scale") != std::string::npos;
                 const float value = (name.find("dt_bias") != std::string::npos) ? 1.0f
+                                  : isGain ? 1.0f
+                                  : isBias ? 0.0f
                                   : isNorm ? identity
                                   : 0.0f;
                 for (size_t i = 0; i < n; ++i) out[i] = value;
@@ -1102,7 +1457,7 @@ struct LocalModel {
             specFor(root["model_type"].asString(text["model_type"].asString()));
 
         return ModelWeights::plan(directory, quantise,
-                                  spec ? spec->skipPrefixes : std::vector<std::string>());
+                                  spec ? skippedPrefixes(*spec, text) : std::vector<std::string>());
     }
 
 
@@ -1141,13 +1496,22 @@ struct LocalModel {
 
         if (!cfg.loadFrom(text, spec)) { error = "config.json: bad or missing fields"; return false; }
 
+        /* decoupled RoPE inside latent attention is the DeepSeek-V3 shape;
+           GLM-5.3 has none and that is the only one written */
+        if (cfg.hasLatentLayers() && cfg.qkRopeDim > 0) {
+            error = "latent attention with qk_rope_head_dim > 0 is not supported";
+            return false;
+        }
+
+        readStopIds(directory, root, text);
+
         quantType = quantise;
 
         /* false: bfloat16 stays as-is rather than being widened. When
            quantising, each shard is converted and released as it is read */
         /* a speculative-decoding head carries a second full bank of experts
            that the ordinary forward pass never reads; do not pay for it */
-        weights.skipPrefixes = spec.skipPrefixes;
+        weights.skipPrefixes = skippedPrefixes(spec, text);
         if (randomSeed && epsilon > 0.0f)
             weights.perturb = perturbInitialiser(*randomSeed, epsilon);
         else if (randomSeed)
@@ -1187,17 +1551,52 @@ struct LocalModel {
        turn; the vocabulary only says which tokens exist */
     void readChatTemplate(const fs::path& directory) {
         templateKnown = templateThinks = false;
+
+        std::string tmpl;
         const fs::path config = directory / "tokenizer_config.json";
-        if (!fs::exists(config)) return;
+        if (fs::exists(config)) {
+            const files::json::ParseResult parsed = files::json::parseFile(config);
+            if (parsed.ok) tmpl = parsed.value["chat_template"].asString();
+        }
 
-        const files::json::ParseResult parsed = files::json::parseFile(config);
-        if (!parsed.ok) return;
-
-        const std::string tmpl = parsed.value["chat_template"].asString();
+        /* newer checkpoints keep the template in a file of its own */
+        const fs::path jinja = directory / "chat_template.jinja";
+        if (tmpl.empty() && fs::exists(jinja)) {
+            std::ifstream in(jinja, std::ios::binary);
+            tmpl.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
         if (tmpl.empty()) return;
 
         templateKnown  = true;
         templateThinks = tmpl.find("<think>") != std::string::npos;
+    }
+
+    /*
+        The ids that end a reply, as the checkpoint declares them in
+        eos_token_id - a single id or a list, in config.json and again in
+        generation_config.json. GLM ends its turn by starting the user's,
+        on <|user|>, which no fixed list of end markers would have guessed
+    */
+    std::vector<size_t> stopIds;
+
+    void readStopIds(const fs::path& directory, const files::json::Value& root,
+                     const files::json::Value& text) {
+        stopIds.clear();
+
+        const auto add = [&](const files::json::Value& v) {
+            if (v.isNumber()) stopIds.push_back(v.asSize());
+            for (size_t i = 0; v.isArray() && i < v.size(); ++i)
+                if (v[i].isNumber()) stopIds.push_back(v[i].asSize());
+        };
+
+        add(root["eos_token_id"]);
+        add(text["eos_token_id"]);
+
+        const fs::path generation = directory / "generation_config.json";
+        if (fs::exists(generation)) {
+            const files::json::ParseResult parsed = files::json::parseFile(generation);
+            if (parsed.ok) add(parsed.value["eos_token_id"]);
+        }
     }
 
     /* true if a think block belongs in the assistant turn */
@@ -1245,6 +1644,15 @@ struct LocalModel {
         Weight w;
         if (name.empty() || !weights.contains(name)) return w;
 
+        /* FP8 kept as codes: [out, in] like every Linear, scales attached */
+        quant::Fp8Tensor f8 = weights.fp8Tensor(name);
+        if (f8.valid()) {
+            w.f8 = f8;
+            w.outDim = f8.outDim;
+            w.inDim = f8.inDim;
+            return w;
+        }
+
         /* a quantised matrix is already [out, in] and never needs the Conv1D
            transpose: only GPT-2 uses that layout and it is not quantised */
         quant::QuantTensor q = weights.quantTensor(name);
@@ -1290,6 +1698,18 @@ struct LocalModel {
         return weights.tensor(name);
     }
 
+    /* fetchDense(name): a matrix as plain [out, in] floats, whatever it was
+       stored as, for the few that are read some way other than a matmul */
+    Tensor<float> fetchDense(const std::string& name) const {
+        const Weight w = fetch(name);
+        if (!w.valid() || w.outDim == 0) return Tensor<float>();
+        if (w.f32.storage) return w.f32.contiguous();
+
+        Tensor<float> out({w.outDim, w.inDim});
+        for (size_t r = 0; r < w.outDim; ++r) widenRow(w, r, out.ptr + r * w.inDim, w.inDim);
+        return out;
+    }
+
     /* rowSlice(w, begin, end): rows of an [out,in] matrix as a view, which is
        how a fused qkv or gate_up is taken apart without copying */
     static Weight rowSlice(const Weight& w, size_t begin, size_t end) {
@@ -1333,6 +1753,14 @@ struct LocalModel {
         Weight w;
         if (name.empty() || !weights.contains(name)) return w;
 
+        quant::Fp8Tensor f8 = weights.fp8Tensor(name);
+        if (f8.valid()) {
+            w.f8 = f8;
+            w.outDim = f8.outDim;
+            w.inDim = f8.inDim;
+            return w;
+        }
+
         quant::QuantTensor q = weights.quantTensor(name);
         if (q.valid()) {
             w.q = q;
@@ -1363,6 +1791,118 @@ struct LocalModel {
             L.inputNormBias    = fetchVector(named(spec.names.inputNormBias, i));
             L.postAttnNorm     = fetchVector(named(spec.names.postAttnNorm, i));
             L.postAttnNormBias = fetchVector(named(spec.names.postAttnNormBias, i));
+
+            /* ---- hyper-connections, in front of both halves of the layer -- */
+            if (cfg.streams() > 1) {
+                L.hcAttn.fn    = fetch(named(spec.names.hcAttnFn, i));
+                L.hcAttn.base  = fetchVector(named(spec.names.hcAttnBase, i));
+                L.hcAttn.scale = fetchVector(named(spec.names.hcAttnScale, i));
+                L.hcFfn.fn     = fetch(named(spec.names.hcFfnFn, i));
+                L.hcFfn.base   = fetchVector(named(spec.names.hcFfnBase, i));
+                L.hcFfn.scale  = fetchVector(named(spec.names.hcFfnScale, i));
+
+                const size_t S = cfg.streams(), width = (2 + S) * S;
+                for (const HyperConnection* hc : {&L.hcAttn, &L.hcFfn})
+                    if (!hc->fn.valid() || hc->fn.outDim != width || hc->fn.inDim != S * cfg.hidden
+                        || !hc->base.storage || hc->base.numel() != width
+                        || !hc->scale.storage || hc->scale.numel() != 3) {
+                        error = "missing or misshapen hyper-connection weights for layer "
+                              + std::to_string(i);
+                        return false;
+                    }
+            }
+
+            /* ---- Kimi Delta Attention ------------------------------------ */
+            if (L.mixer == MixerKind::KimiDelta) {
+                L.linQ      = fetch(named(spec.names.linQ, i));
+                L.linK      = fetch(named(spec.names.linK, i));
+                L.linV      = fetch(named(spec.names.linV, i));
+                L.linFA     = fetch(named(spec.names.linFA, i));
+                L.linFB     = fetch(named(spec.names.linFB, i));
+                L.linGA     = fetch(named(spec.names.linGA, i));
+                L.linGB     = fetch(named(spec.names.linGB, i));
+                L.linB      = fetch(named(spec.names.linB, i));
+                L.linOut    = fetch(named(spec.names.linOut, i));
+                L.linALog   = fetchVector(named(spec.names.linALog, i));
+                L.linDtBias = fetchVector(named(spec.names.linDtBias, i));
+                L.linNorm   = fetchVector(named(spec.names.linNorm, i));
+
+                /* three [width, 1, kernel] kernels stacked into the one
+                   [3 * width, kernel] the shared convolution code expects */
+                const Tensor<float> cq = fetchVector(named(spec.names.linConvQ, i));
+                const Tensor<float> ck = fetchVector(named(spec.names.linConvK, i));
+                const Tensor<float> cv = fetchVector(named(spec.names.linConvV, i));
+                const size_t each = cfg.linKeyWidth() * cfg.convKernel;
+
+                const bool ok = L.linQ.valid() && L.linK.valid() && L.linV.valid()
+                    && L.linFA.valid() && L.linFB.valid() && L.linGA.valid() && L.linGB.valid()
+                    && L.linB.valid() && L.linOut.valid()
+                    && L.linALog.storage && L.linDtBias.storage && L.linNorm.storage
+                    && cq.storage && ck.storage && cv.storage
+                    && cq.numel() == each && ck.numel() == each && cv.numel() == each
+                    && L.linDtBias.numel() == cfg.linKeyWidth()
+                    && L.linALog.numel() == cfg.linKeyHeads;
+                if (!ok) {
+                    error = "missing or misshapen linear-attention weights for layer "
+                          + std::to_string(i);
+                    return false;
+                }
+
+                L.linConv = Tensor<float>({3 * cfg.linKeyWidth(), cfg.convKernel});
+                const Tensor<float> parts[] = {cq.contiguous(), ck.contiguous(), cv.contiguous()};
+                for (size_t p = 0; p < 3; ++p)
+                    std::copy(parts[p].ptr, parts[p].ptr + each, L.linConv.ptr + p * each);
+
+                if (!loadFeedForward(L, i)) return false;
+                continue;
+            }
+
+            /* ---- multi-head latent attention ----------------------------- */
+            if (L.mixer == MixerKind::LatentAttention) {
+                L.mlaQA      = fetch(named(spec.names.mlaQA, i));
+                L.mlaQB      = fetch(named(spec.names.mlaQB, i));
+                L.mlaKVA     = fetch(named(spec.names.mlaKVA, i));
+                L.mlaQANorm  = fetchVector(named(spec.names.mlaQANorm, i));
+                L.mlaKVANorm = fetchVector(named(spec.names.mlaKVANorm, i));
+                L.mlaKVB     = fetchDense(named(spec.names.mlaKVB, i));
+                L.o          = fetch(named(spec.names.o, i));
+
+                const size_t rows = cfg.nHead * (cfg.qkNopeDim + cfg.vHeadDim);
+                const bool ok = L.mlaQA.valid() && L.mlaQB.valid() && L.mlaKVA.valid()
+                    && L.mlaQANorm.storage && L.mlaKVANorm.storage && L.o.valid()
+                    && L.mlaKVB.storage && L.mlaKVB.shape.size() == 2
+                    && L.mlaKVB.shape[0] == rows && L.mlaKVB.shape[1] == cfg.kvLoraRank
+                    && L.mlaQB.outDim == cfg.nHead * cfg.qkNopeDim
+                    && L.mlaKVA.outDim == cfg.kvLoraRank;
+                if (!ok) {
+                    error = "missing or misshapen latent-attention weights for layer "
+                          + std::to_string(i);
+                    return false;
+                }
+
+                /* a layer either runs its own indexer or borrows the last
+                   one's choice; the first latent layer must be a full one */
+                if (cfg.indexHeads > 0 && !cfg.indexShared[i]) {
+                    L.idxQB        = fetch(named(spec.names.idxQB, i));
+                    L.idxK         = fetch(named(spec.names.idxK, i));
+                    L.idxWeights   = fetch(named(spec.names.idxWeights, i));
+                    L.idxGate      = fetch(named(spec.names.idxGate, i));
+                    L.idxKNorm     = fetchVector(named(spec.names.idxKNorm, i));
+                    L.idxKNormBias = fetchVector(named(spec.names.idxKNormBias, i));
+                    L.idxApe       = fetchVector(named(spec.names.idxApe, i));
+
+                    if (!L.idxQB.valid() || !L.idxK.valid() || !L.idxWeights.valid()
+                        || !L.idxGate.valid() || !L.idxKNorm.storage || !L.idxApe.storage
+                        || L.idxApe.numel() != cfg.indexKPool * cfg.indexHeadDim) {
+                        error = "missing or misshapen indexer weights for layer "
+                              + std::to_string(i);
+                        return false;
+                    }
+                }
+
+                if (!loadFeedForward(L, i)) return false;
+                continue;
+            }
 
             /* ---- Gated DeltaNet layers take an entirely different set ---- */
             if (L.mixer == MixerKind::GatedDeltaNet) {
@@ -1441,17 +1981,23 @@ struct LocalModel {
           the same three matrices
     */
     bool loadFeedForward(LocalLayer& L, size_t i) {
-        if (spec.mlp == MLPKind::MoE) {
+        L.moe = spec.mlp == MLPKind::MoE && !cfg.denseLayer(i);
+
+        if (L.moe) {
             L.router      = fetch(named(spec.names.router, i));
+            L.routerBias  = fetchVector(named(spec.names.routerBias, i));
             L.sharedScale = fetch(named(spec.names.sharedScale, i));
             L.shared.gate = fetch(named(spec.names.sharedGate, i));
             L.shared.up   = fetch(named(spec.names.sharedUp, i));
             L.shared.down = fetch(named(spec.names.sharedDown, i));
 
+            /* the scale is only demanded of an architecture that names one */
             const bool wantsShared = !spec.names.sharedGate.empty();
-            const bool hasShared   = L.sharedScale.valid() && L.shared.gate.valid()
+            const bool hasShared   = (L.sharedScale.valid() || spec.names.sharedScale.empty())
+                                  && L.shared.gate.valid()
                                   && L.shared.up.valid()   && L.shared.down.valid();
-            if (!L.router.valid() || (wantsShared && !hasShared)) {
+            if (!L.router.valid() || (wantsShared && !hasShared)
+                || (!spec.names.routerBias.empty() && !L.routerBias.storage)) {
                 error = "missing router or shared expert for layer " + std::to_string(i);
                 return false;
             }
@@ -1539,6 +2085,12 @@ struct LocalModel {
         for (Expert& e : L.experts) {
             visit(e.gate); visit(e.up); visit(e.down);
         }
+
+        visit(L.linQ);  visit(L.linK);  visit(L.linV);
+        visit(L.linFA); visit(L.linFB); visit(L.linGA); visit(L.linGB);
+        visit(L.mlaQA); visit(L.mlaQB); visit(L.mlaKVA);
+        visit(L.idxQB); visit(L.idxK);  visit(L.idxWeights); visit(L.idxGate);
+        visit(L.hcAttn.fn); visit(L.hcFfn.fn);
     }
 
     template <typename Visit>
@@ -1802,6 +2354,7 @@ struct LocalModel {
 
     static void widenRow(const Weight& table, size_t index, float* out, size_t n) {
         if (table.isQuant()) { quant::dequantRow(table.q, index, out); return; }
+        if (table.isFP8())   { table.f8.dequantRow(index, out); return; }
 
         if (table.isBF16()) {
             const uint16_t* row = table.bf16.ptr + index * n;
@@ -1941,6 +2494,45 @@ struct LocalModel {
 
 
     /*
+        causalConvolution(in, count, CW, K, kernel, window, out):
+        - each channel mixed with its previous K-1 timesteps, then SiLU. The
+          window carries the last K-1 inputs between calls, which is what
+          makes decoding one token at a time agree with a whole prompt
+    */
+    static void causalConvolution(const float* in, size_t count, size_t CW, size_t K,
+                                  const float* kernel, std::vector<float>& window, float* out) {
+        for (size_t t = 0; t < count; ++t) {
+            for (size_t c = 0; c < CW; ++c) {
+                float acc = 0.0f;
+                for (size_t j = 0; j < K; ++j) {
+                    const long at = static_cast<long>(t) - static_cast<long>(K - 1)
+                                  + static_cast<long>(j);
+                    /* a negative index reaches back into the carried
+                       window, whose last entry is the most recent input */
+                    const float xv = (at >= 0)
+                        ? in[static_cast<size_t>(at) * CW + c]
+                        : window[static_cast<size_t>(static_cast<long>(K) - 1 + at) * CW + c];
+                    acc += kernel[c * K + j] * xv;
+                }
+                out[t * CW + c] = siluOf(acc);
+            }
+        }
+
+        /* carry the last K-1 inputs forward for the next call */
+        std::vector<float> next((K - 1) * CW, 0.0f);
+        for (size_t i = 0; i < K - 1; ++i) {
+            const long at = static_cast<long>(count) - static_cast<long>(K - 1)
+                          + static_cast<long>(i);
+            const size_t from = (at >= 0) ? static_cast<size_t>(at)
+                                          : static_cast<size_t>(static_cast<long>(K) - 1 + at);
+            const float* src = (at >= 0) ? &in[from * CW] : &window[from * CW];
+            std::copy(src, src + CW, &next[i * CW]);
+        }
+        window.swap(next);
+    }
+
+
+    /*
         gatedDeltaNetMixer(...):
         - linear attention. Instead of keeping every past key and value and
           scoring against all of them, each head carries ONE [keyDim, valueDim]
@@ -2021,39 +2613,9 @@ struct LocalModel {
         }
 
         /* ---- causal depthwise convolution, kernel K, per channel -------- */
-        std::vector<float>& window = cache.convWindow[layer];   // (K-1) * CW
         std::vector<float> conv(count * CW);
-
-        for (size_t t = 0; t < count; ++t) {
-            for (size_t c = 0; c < CW; ++c) {
-                float acc = 0.0f;
-                for (size_t j = 0; j < K; ++j) {
-                    const long at = static_cast<long>(t) - static_cast<long>(K - 1)
-                                  + static_cast<long>(j);
-                    /* a negative index reaches back into the carried
-                       window, whose last entry is the most recent input */
-                    const float xv = (at >= 0)
-                        ? qkv[static_cast<size_t>(at) * CW + c]
-                        : window[static_cast<size_t>(static_cast<long>(K) - 1 + at) * CW + c];
-                    acc += L.linConv.ptr[c * K + j] * xv;
-                }
-                conv[t * CW + c] = siluOf(acc);
-            }
-        }
-
-        /* carry the last K-1 inputs forward for the next call */
-        {
-            std::vector<float> next((K - 1) * CW, 0.0f);
-            for (size_t i = 0; i < K - 1; ++i) {
-                const long at = static_cast<long>(count) - static_cast<long>(K - 1)
-                              + static_cast<long>(i);
-                const size_t from = (at >= 0) ? static_cast<size_t>(at)
-                                              : static_cast<size_t>(static_cast<long>(K) - 1 + at);
-                const float* src = (at >= 0) ? &qkv[from * CW] : &window[from * CW];
-                std::copy(src, src + CW, &next[i * CW]);
-            }
-            window.swap(next);
-        }
+        causalConvolution(qkv.data(), count, CW, K, L.linConv.ptr, cache.convWindow[layer],
+                          conv.data());
         if (trace) trace->add(tag + "conv", conv.data(), count * CW);
 
         /* ---- the recurrence -------------------------------------------- */
@@ -2132,6 +2694,472 @@ struct LocalModel {
 
 
     /*
+        kimiDeltaMixer(...):
+        - Kimi Delta Attention, GLM-5.3's linear layers. The same delta-rule
+          state as Gated DeltaNet, one [dim, dim] matrix per head, with three
+          differences:
+            - the decay is per KEY CHANNEL, not one number per head. Each row
+              of the state forgets at its own rate, set by a low-rank
+              projection of the token (f_a then f_b)
+            - that decay is bounded: lower * sigmoid(...), so no channel can
+              forget faster than e^lower per step
+            - the output gate is a sigmoid of its own low-rank projection
+              rather than SiLU of a full-width one
+        - q, k and v come from separate projections, each with its own short
+          convolution, stacked so the convolution code is shared
+        - heads are independent, so a prompt is split across the pool head
+          by head; within a head the tokens have to go in order
+    */
+    void kimiDeltaMixer(const float* h, const LocalLayer& L, size_t layer,
+                        size_t count, LocalCache& cache,
+                        float* out, const std::string& tag, LocalTrace* trace) const {
+        const size_t nH = cfg.linKeyHeads;
+        const size_t D  = cfg.linKeyDim;          // keys and values are the same width
+        const size_t W  = nH * D;
+        const size_t CW = 3 * W;
+        const size_t K  = cfg.convKernel;
+
+        std::vector<float> qkv(count * CW), part(count * W);
+        const Weight* projections[] = {&L.linQ, &L.linK, &L.linV};
+        for (size_t p = 0; p < 3; ++p) {
+            apply(h, *projections[p], part.data(), count);
+            for (size_t t = 0; t < count; ++t)
+                std::copy(&part[t * W], &part[t * W] + W, &qkv[t * CW + p * W]);
+        }
+
+        std::vector<float> conv(count * CW);
+        causalConvolution(qkv.data(), count, CW, K, L.linConv.ptr, cache.convWindow[layer],
+                          conv.data());
+        if (trace) trace->add(tag + "conv", conv.data(), count * CW);
+
+        /* the forget gate, as a log-decay per channel, and the write strength */
+        std::vector<float> rank(count * L.linFA.outDim), decay(count * W), beta(count * nH);
+        apply(h, L.linFA, rank.data(), count);
+        apply(rank.data(), L.linFB, decay.data(), count);
+        apply(h, L.linB, beta.data(), count);
+
+        for (size_t t = 0; t < count; ++t)
+            for (size_t head = 0; head < nH; ++head) {
+                const float rate = std::exp(L.linALog.ptr[head]);
+                for (size_t d = 0; d < D; ++d) {
+                    const size_t c = head * D + d;
+                    const float f = decay[t * W + c] + L.linDtBias.ptr[c];
+                    const float g = cfg.linSafeGate ? cfg.linLowerBound * sigmoidOf(rate * f)
+                                                    : -rate * softplusOf(f);
+                    decay[t * W + c] = std::exp(g);
+                }
+            }
+        for (float& b : beta) b = sigmoidOf(b);
+
+        /* ---- the recurrence, one head per job ---------------------------- */
+        std::vector<float>& state = cache.recurrent[layer];     // nH * D * D
+        std::vector<float> core(count * W);
+        const float qScale = 1.0f / std::sqrt(static_cast<float>(D));
+
+        kernels::Pool::instance().run(nH, [&](size_t begin, size_t end) {
+            std::vector<float> qh(D), kh(D), kv(D), delta(D);
+
+            for (size_t head = begin; head < end; ++head) {
+                float* S = &state[head * D * D];
+
+                for (size_t t = 0; t < count; ++t) {
+                    const float* row = &conv[t * CW];
+                    std::copy(row + head * D,         row + head * D + D,         qh.begin());
+                    std::copy(row + W + head * D,     row + W + head * D + D,     kh.begin());
+                    const float* vh = row + 2 * W + head * D;
+
+                    l2normalise(qh.data(), D);
+                    l2normalise(kh.data(), D);
+                    for (size_t i = 0; i < D; ++i) qh[i] *= qScale;
+
+                    /* row i of the state is key channel i, decayed by its own rate */
+                    const float* a = &decay[t * W + head * D];
+                    for (size_t i = 0; i < D; ++i) {
+                        float* r = S + i * D;
+                        for (size_t d = 0; d < D; ++d) r[d] *= a[i];
+                    }
+
+                    std::fill(kv.begin(), kv.end(), 0.0f);
+                    for (size_t i = 0; i < D; ++i) {
+                        const float* r = S + i * D;
+                        for (size_t d = 0; d < D; ++d) kv[d] += r[d] * kh[i];
+                    }
+
+                    const float b = beta[t * nH + head];
+                    for (size_t d = 0; d < D; ++d) delta[d] = (vh[d] - kv[d]) * b;
+
+                    for (size_t i = 0; i < D; ++i) {
+                        float* r = S + i * D;
+                        for (size_t d = 0; d < D; ++d) r[d] += kh[i] * delta[d];
+                    }
+
+                    float* o = &core[t * W + head * D];
+                    std::fill(o, o + D, 0.0f);
+                    for (size_t i = 0; i < D; ++i) {
+                        const float* r = S + i * D;
+                        for (size_t d = 0; d < D; ++d) o[d] += r[d] * qh[i];
+                    }
+                }
+            }
+        });
+
+        /* ---- normalise each head, gated by sigmoid, then project out ------ */
+        std::vector<float> gate(count * W);
+        rank.assign(count * L.linGA.outDim, 0.0f);
+        apply(h, L.linGA, rank.data(), count);
+        apply(rank.data(), L.linGB, gate.data(), count);
+
+        for (size_t t = 0; t < count; ++t)
+            for (size_t head = 0; head < nH; ++head) {
+                float* o = &core[t * W + head * D];
+                rmsNormRow(o, L.linNorm.ptr, o, D, cfg.normEps);
+                const float* g = &gate[t * W + head * D];
+                for (size_t d = 0; d < D; ++d) o[d] *= sigmoidOf(g[d]);
+            }
+        if (trace) trace->add(tag + "gatednorm", core.data(), count * W);
+
+        apply(core.data(), L.linOut, out, count);
+        if (trace) trace->add(tag + "attnout", out, count * cfg.hidden);
+    }
+
+
+    /*
+        selectKeys(h, qResid, L, layer, count, startPos, cache, selection):
+        - the indexer behind DeepSeek sparse attention, in GLM-5.3's pooled
+          form. Every token leaves a small key; each run of indexKPool of them
+          is folded into ONE pooled key, as a softmax-weighted average whose
+          weights the tokens compute themselves. A query scores pools rather
+          than tokens - relu(q . pool) per indexer head, summed under weights
+          the query also computes - and keeps the indexTopK / indexKPool best
+          pools, plus the unfinished pool at the end.
+        - while a query can see no more pools than it is allowed to keep,
+          it keeps all of them and the result is ordinary causal attention.
+          That is checked first and the scoring skipped entirely, which is
+          what every query in the first two thousand-odd tokens takes
+        - the pooled keys are built once, when a pool's last token arrives,
+          and cached; a decode step only ever adds to them
+    */
+    void selectKeys(const float* h, const float* qResid, const LocalLayer& L, size_t layer,
+                    size_t count, size_t startPos, LocalCache& cache,
+                    std::vector<KeySelection>& selection) const {
+        const size_t Di = cfg.indexHeadDim, nI = cfg.indexHeads, P = cfg.indexKPool;
+        const size_t budget = cfg.indexTopK / P;
+
+        float* keys  = cache.indexKeys[layer].data();
+        float* gates = cache.indexGates[layer].data();
+        float* pools = cache.poolKeys[layer].data();
+
+        std::vector<float> k(count * Di);
+        apply(h, L.idxK, k.data(), count);
+        apply(h, L.idxGate, gates + startPos * Di, count);
+
+        std::vector<float> weight(P);
+        for (size_t t = 0; t < count; ++t) {
+            const size_t pos = startPos + t;
+            layerNormRow(&k[t * Di], L.idxKNorm.ptr,
+                         L.idxKNormBias.storage ? L.idxKNormBias.ptr : nullptr,
+                         keys + pos * Di, Di, 1e-6f);
+
+            /* this token completes a pool: fold its members into one key,
+               channel by channel, by a softmax over the members */
+            if ((pos + 1) % P != 0) continue;
+            const size_t first = pos + 1 - P;
+            float* pooled = pools + (pos / P) * Di;
+
+            for (size_t d = 0; d < Di; ++d) {
+                float best = -1e30f;
+                for (size_t i = 0; i < P; ++i) {
+                    weight[i] = gates[(first + i) * Di + d] + L.idxApe.ptr[i * Di + d];
+                    best = std::max(best, weight[i]);
+                }
+                float sum = 0.0f;
+                for (size_t i = 0; i < P; ++i) { weight[i] = std::exp(weight[i] - best); sum += weight[i]; }
+
+                float acc = 0.0f;
+                for (size_t i = 0; i < P; ++i) acc += weight[i] / sum * keys[(first + i) * Di + d];
+                pooled[d] = acc;
+            }
+        }
+
+        selection.assign(count, KeySelection{});
+
+        bool anySparse = false;
+        for (size_t t = 0; t < count; ++t)
+            if ((startPos + t + 1) / P > budget || !cfg.indexTail) anySparse = true;
+        if (!anySparse) return;
+
+        std::vector<float> q(count * nI * Di), w(count * nI);
+        apply(qResid, L.idxQB, q.data(), count);
+        apply(h, L.idxWeights, w.data(), count);
+
+        const float headScale = 1.0f / std::sqrt(static_cast<float>(nI));
+        const float dimScale  = 1.0f / std::sqrt(static_cast<float>(Di));
+
+        kernels::Pool::instance().run(count, [&](size_t begin, size_t end) {
+            std::vector<float>  score;
+            std::vector<size_t> order;
+
+            for (size_t t = begin; t < end; ++t) {
+                const size_t pos = startPos + t;
+                const size_t complete = (pos + 1) / P;      // pools wholly at or before pos
+                KeySelection& s = selection[t];
+
+                if (complete <= budget && cfg.indexTail) continue;      // sees everything
+
+                score.assign(complete, 0.0f);
+                for (size_t p = 0; p < complete; ++p) {
+                    float total = 0.0f;
+                    for (size_t head = 0; head < nI; ++head) {
+                        const float logit =
+                            kernels::dot(&q[(t * nI + head) * Di], pools + p * Di, Di) * dimScale;
+                        total += w[t * nI + head] * headScale * std::max(0.0f, logit);
+                    }
+                    score[p] = total;
+                }
+
+                const size_t keep = std::min(budget, complete);
+                order.resize(complete);
+                for (size_t p = 0; p < complete; ++p) order[p] = p;
+                std::nth_element(order.begin(), order.begin() + static_cast<long>(keep), order.end(),
+                                 [&](size_t a, size_t b) { return score[a] > score[b]; });
+
+                s.dense = false;
+                s.keys.clear();
+                for (size_t i = 0; i < keep; ++i)
+                    for (size_t j = 0; j < P; ++j)
+                        s.keys.push_back(static_cast<uint32_t>(order[i] * P + j));
+
+                /* the pool still filling, whatever it would have scored */
+                if (cfg.indexTail)
+                    for (size_t j = complete * P; j <= pos; ++j)
+                        s.keys.push_back(static_cast<uint32_t>(j));
+
+                std::sort(s.keys.begin(), s.keys.end());
+            }
+        });
+    }
+
+
+    /*
+        latentAttentionMixer(...):
+        - multi-head latent attention, as DeepSeek introduced it and GLM-5.3
+          uses it, without positional encoding at all.
+        - every token is squeezed into one kvLoraRank-wide latent, and each
+          head's key and value would be that latent times its own slice of
+          kv_b_proj. Nothing ever expands it. Because both are linear,
+              q . (Wk c)  =  (Wk^T q) . c       sum p (Wv c)  =  Wv (sum p c)
+          so each query is folded through Wk once, scored straight against
+          the cached latents, and the weighted latents are pushed through Wv
+          once at the end. The cache holds the latents and nothing else.
+        - which latents a query may score is the indexer's call; until the
+          context outgrows its budget that is all of them
+    */
+    void latentAttentionMixer(const float* h, const LocalLayer& L, size_t layer,
+                              size_t count, size_t startPos, LocalCache& cache,
+                              std::vector<KeySelection>& selection, float* out,
+                              const std::string& tag, LocalTrace* trace) const {
+        const size_t R  = cfg.qLoraRank, C = cfg.kvLoraRank;
+        const size_t Dn = cfg.qkNopeDim, Dv = cfg.vHeadDim;
+        const size_t nH = cfg.nHead;
+        const size_t perHead = Dn + Dv;                // kv_b_proj rows per head
+
+        std::vector<float> qr(count * R), q(count * nH * Dn), kv(count * C), attn(count * nH * Dv);
+
+        apply(h, L.mlaQA, qr.data(), count);
+        for (size_t t = 0; t < count; ++t)
+            rmsNormRow(&qr[t * R], L.mlaQANorm.ptr, &qr[t * R], R, cfg.normEps);
+        apply(qr.data(), L.mlaQB, q.data(), count);
+
+        float* latent = cache.keys[layer].data();
+        apply(h, L.mlaKVA, kv.data(), count);
+        for (size_t t = 0; t < count; ++t)
+            rmsNormRow(&kv[t * C], L.mlaKVANorm.ptr, latent + (startPos + t) * C, C, cfg.normEps);
+
+        /* a layer with its own indexer chooses afresh; one without reuses
+           whatever the last one chose for these same queries */
+        if (L.idxQB.valid())
+            selectKeys(h, qr.data(), L, layer, count, startPos, cache, selection);
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(Dn + cfg.qkRopeDim));
+        const float* Wkv = L.mlaKVB.ptr;
+
+        kernels::Pool::instance().run(count * nH, [&](size_t begin, size_t end) {
+            std::vector<float> folded(C), context(C), scores;
+
+            for (size_t job = begin; job < end; ++job) {
+                const size_t t = job / nH, head = job % nH;
+                const size_t pos = startPos + t;
+
+                const float* qh = &q[(t * nH + head) * Dn];
+                const float* Wk = Wkv + head * perHead * C;
+                const float* Wv = Wk + Dn * C;
+
+                std::fill(folded.begin(), folded.end(), 0.0f);
+                for (size_t d = 0; d < Dn; ++d) {
+                    const float qd = qh[d];
+                    const float* row = Wk + d * C;
+                    for (size_t c = 0; c < C; ++c) folded[c] += qd * row[c];
+                }
+
+                const bool dense = selection.size() <= t || selection[t].dense;
+                const uint32_t* chosen = dense ? nullptr : selection[t].keys.data();
+                const size_t n = dense ? pos + 1 : selection[t].keys.size();
+                const auto keyAt = [&](size_t i) { return dense ? i : size_t(chosen[i]); };
+
+                scores.resize(n);
+                float best = -1e30f;
+                for (size_t i = 0; i < n; ++i) {
+                    scores[i] = kernels::dot(folded.data(), latent + keyAt(i) * C, C) * scale;
+                    best = std::max(best, scores[i]);
+                }
+
+                float sum = 0.0f;
+                for (size_t i = 0; i < n; ++i) { scores[i] = std::exp(scores[i] - best); sum += scores[i]; }
+                const float inv = 1.0f / sum;
+
+                std::fill(context.begin(), context.end(), 0.0f);
+                for (size_t i = 0; i < n; ++i) {
+                    const float p = scores[i] * inv;
+                    const float* c = latent + keyAt(i) * C;
+                    for (size_t j = 0; j < C; ++j) context[j] += p * c[j];
+                }
+
+                float* o = &attn[(t * nH + head) * Dv];
+                for (size_t v = 0; v < Dv; ++v) o[v] = kernels::dot(Wv + v * C, context.data(), C);
+            }
+        });
+
+        apply(attn.data(), L.o, out, count);
+        if (trace) trace->add(tag + "attnout", out, count * cfg.hidden);
+    }
+
+
+    /*
+        hcCollapse(x, hc, count, collapsed, post, comb):
+        - manifold-constrained hyper-connections. The residual is S streams
+          wide, and a block takes one input, so the streams are collapsed by
+          a weighted sum. The weights come from the streams themselves: all
+          S of them, RMS-normalised together, are projected by fn onto
+              S    "pre"  weights   sigmoid, to collapse with
+              S    "post" weights   2 * sigmoid, to expand the output with
+              S*S  "comb" weights   how the streams mix with one another
+        - comb is pushed toward doubly stochastic - rows and columns each
+          summing to one - by alternately normalising them, which is what
+          keeps mixing the streams from growing them layer after layer
+        - post and comb are handed back for hcExpand after the block
+    */
+    void hcCollapse(const float* x, const HyperConnection& hc, size_t count,
+                    float* collapsed, float* post, float* comb) const {
+        const size_t H = cfg.hidden, S = cfg.streams();
+        const size_t width = S * H, P = (2 + S) * S;
+        const float eps = cfg.hcEps;
+
+        std::vector<float> normed(count * width), mix(count * P);
+        for (size_t t = 0; t < count; ++t) {
+            const float* row = x + t * width;
+            float sum = 0.0f;
+            for (size_t i = 0; i < width; ++i) sum += row[i] * row[i];
+            const float inv = 1.0f / std::sqrt(sum / static_cast<float>(width) + cfg.normEps);
+            for (size_t i = 0; i < width; ++i) normed[t * width + i] = row[i] * inv;
+        }
+        apply(normed.data(), hc.fn, mix.data(), count);
+
+        const float* base = hc.base.ptr;
+        const float* gain = hc.scale.ptr;
+        std::vector<float> pre(S);
+
+        for (size_t t = 0; t < count; ++t) {
+            const float* m = &mix[t * P];
+            float* po = post + t * S;
+            float* cb = comb + t * S * S;
+
+            for (size_t n = 0; n < S; ++n) {
+                pre[n] = sigmoidOf(m[n] * gain[0] + base[n]) + eps;
+                po[n]  = 2.0f * sigmoidOf(m[S + n] * gain[1] + base[S + n]);
+            }
+
+            /* a softmax along each row, then Sinkhorn: columns, then rows
+               and columns again, hcIters normalisations of columns in all */
+            for (size_t i = 0; i < S; ++i) {
+                float* r = cb + i * S;
+                float best = -1e30f;
+                for (size_t j = 0; j < S; ++j) {
+                    r[j] = m[2 * S + i * S + j] * gain[2] + base[2 * S + i * S + j];
+                    best = std::max(best, r[j]);
+                }
+                float sum = 0.0f;
+                for (size_t j = 0; j < S; ++j) { r[j] = std::exp(r[j] - best); sum += r[j]; }
+                for (size_t j = 0; j < S; ++j) r[j] = r[j] / sum + eps;
+            }
+
+            const auto columns = [&] {
+                for (size_t j = 0; j < S; ++j) {
+                    float sum = 0.0f;
+                    for (size_t i = 0; i < S; ++i) sum += cb[i * S + j];
+                    for (size_t i = 0; i < S; ++i) cb[i * S + j] /= sum + eps;
+                }
+            };
+            const auto rows = [&] {
+                for (size_t i = 0; i < S; ++i) {
+                    float sum = 0.0f;
+                    for (size_t j = 0; j < S; ++j) sum += cb[i * S + j];
+                    for (size_t j = 0; j < S; ++j) cb[i * S + j] /= sum + eps;
+                }
+            };
+
+            columns();
+            for (size_t it = 1; it < cfg.hcIters; ++it) { rows(); columns(); }
+
+            float* into = collapsed + t * H;
+            std::fill(into, into + H, 0.0f);
+            for (size_t n = 0; n < S; ++n) {
+                const float* stream = x + t * width + n * H;
+                for (size_t i = 0; i < H; ++i) into[i] += pre[n] * stream[i];
+            }
+        }
+    }
+
+    /*
+        hcExpand(x, out, post, comb, count):
+        - the other half. Stream n becomes the block's output scaled by
+          post[n], plus every old stream m weighted by comb[m][n]. With one
+          stream, post of one and comb of one, this is the plain residual add
+    */
+    void hcExpand(float* x, const float* out, const float* post, const float* comb,
+                  size_t count) const {
+        const size_t H = cfg.hidden, S = cfg.streams();
+        std::vector<float> next(S * H);
+
+        for (size_t t = 0; t < count; ++t) {
+            float* streams = x + t * S * H;
+            const float* po = post + t * S;
+            const float* cb = comb + t * S * S;
+
+            for (size_t n = 0; n < S; ++n) {
+                float* into = &next[n * H];
+                for (size_t i = 0; i < H; ++i) into[i] = po[n] * out[t * H + i];
+                for (size_t m = 0; m < S; ++m) {
+                    const float w = cb[m * S + n];
+                    const float* stream = streams + m * H;
+                    for (size_t i = 0; i < H; ++i) into[i] += w * stream[i];
+                }
+            }
+            std::copy(next.begin(), next.end(), streams);
+        }
+    }
+
+
+    /* SwiGLU's product, with the clamp some models put on both inputs */
+    float swiglu(float gate, float up) const {
+        if (cfg.swigluLimit > 0.0f) {
+            gate = std::min(gate, cfg.swigluLimit);
+            up   = std::clamp(up, -cfg.swigluLimit, cfg.swigluLimit);
+        }
+        return activation(gate) * up;
+    }
+
+
+    /*
         moeBlock(h, L, count, out):
         - the feed forward as a bank of small experts. A router scores every
           one of them, the best few run, and their outputs are summed in
@@ -2151,27 +3179,29 @@ struct LocalModel {
         const size_t E = cfg.numExperts;
         const size_t K = cfg.expertsPerToken;
         const size_t M = cfg.moeIntermediate;
-        const size_t S = cfg.sharedIntermediate;
 
         /*
             ---- the shared expert, which every token pays for ----------------
             Qwen3-Next has one; Qwen3-MoE does not. The routed experts below
             ACCUMULATE into `out`, so when there is no shared expert to write
             it first it has to be zeroed here, or the sum starts from whatever
-            the buffer held last
+            the buffer held last. GLM's is added in as it is, with no gate
         */
         if (L.shared.gate.valid()) {
+            const size_t S = L.shared.gate.outDim;
             std::vector<float> sg(count * S), su(count * S), scale(count);
 
             apply(h, L.shared.gate, sg.data(), count);
             apply(h, L.shared.up,   su.data(), count);
-            for (size_t i = 0; i < count * S; ++i) sg[i] = activation(sg[i]) * su[i];
+            for (size_t i = 0; i < count * S; ++i) sg[i] = swiglu(sg[i], su[i]);
             apply(sg.data(), L.shared.down, out, count);
 
-            apply(h, L.sharedScale, scale.data(), count);
-            for (size_t t = 0; t < count; ++t) {
-                const float g = sigmoidOf(scale[t]);
-                for (size_t i = 0; i < H; ++i) out[t * H + i] *= g;
+            if (L.sharedScale.valid()) {
+                apply(h, L.sharedScale, scale.data(), count);
+                for (size_t t = 0; t < count; ++t) {
+                    const float g = sigmoidOf(scale[t]);
+                    for (size_t i = 0; i < H; ++i) out[t * H + i] *= g;
+                }
             }
             if (trace) trace->add(tag + "shared", out, count * H);
         } else {
@@ -2186,22 +3216,60 @@ struct LocalModel {
 
         apply(h, L.router, logits.data(), count);
 
+        std::vector<float> choice(E);
+
         for (size_t t = 0; t < count; ++t) {
             float* row = &logits[t * E];
 
-            float best = -1e30f;
-            for (size_t e = 0; e < E; ++e) best = std::max(best, row[e]);
+            if (cfg.sigmoidRouter) {
+                /*
+                    Each expert scored on its own, by a sigmoid. The bias is
+                    added only to decide WHICH experts run - it is how the
+                    load is kept balanced without a loss term - and the
+                    weights they then get are the unbiased scores
+                */
+                for (size_t e = 0; e < E; ++e) {
+                    row[e] = sigmoidOf(row[e]);
+                    choice[e] = row[e] + (L.routerBias.storage ? L.routerBias.ptr[e] : 0.0f);
+                }
 
-            float sum = 0.0f;
-            for (size_t e = 0; e < E; ++e) { row[e] = std::exp(row[e] - best); sum += row[e]; }
+                /* confine the choice to the best groups first, each group
+                   rated by the sum of its two best experts */
+                const size_t G = cfg.expertGroups;
+                if (G > 1 && E % G == 0 && cfg.groupsPerToken < G) {
+                    const size_t per = E / G;
+                    std::vector<float>  rating(G);
+                    std::vector<size_t> groups(G);
+                    for (size_t g = 0; g < G; ++g) {
+                        float first = -1e30f, second = -1e30f;
+                        for (size_t e = g * per; e < (g + 1) * per; ++e) {
+                            if (choice[e] > first) { second = first; first = choice[e]; }
+                            else if (choice[e] > second) second = choice[e];
+                        }
+                        rating[g] = first + second;
+                        groups[g] = g;
+                    }
+                    std::nth_element(groups.begin(), groups.begin() + static_cast<long>(cfg.groupsPerToken),
+                                     groups.end(), [&](size_t a, size_t b) { return rating[a] > rating[b]; });
+                    for (size_t i = cfg.groupsPerToken; i < G; ++i)
+                        for (size_t e = groups[i] * per; e < (groups[i] + 1) * per; ++e)
+                            choice[e] = -1e30f;
+                }
+            } else {
+                float best = -1e30f;
+                for (size_t e = 0; e < E; ++e) best = std::max(best, row[e]);
 
-            const float inv = 1.0f / sum;
-            for (size_t e = 0; e < E; ++e) row[e] *= inv;
+                float sum = 0.0f;
+                for (size_t e = 0; e < E; ++e) { row[e] = std::exp(row[e] - best); sum += row[e]; }
+
+                const float inv = 1.0f / sum;
+                for (size_t e = 0; e < E; ++e) { row[e] *= inv; choice[e] = row[e]; }
+            }
 
             /* ten out of five hundred: a selection pass, not a sort */
             for (size_t e = 0; e < E; ++e) order[e] = e;
             std::nth_element(order.begin(), order.begin() + static_cast<long>(K), order.end(),
-                             [row](size_t x, size_t y) { return row[x] > row[y]; });
+                             [&](size_t x, size_t y) { return choice[x] > choice[y]; });
 
             float total = 0.0f;
             for (size_t j = 0; j < K; ++j) {
@@ -2211,11 +3279,14 @@ struct LocalModel {
             }
 
             /* the chosen few carry only part of the distribution, so they
-               are rescaled to sum to one rather than to whatever they got */
+               are rescaled to sum to one rather than to whatever they got.
+               The 1e-20 is the reference's, there for an all-zero sigmoid */
             if (cfg.normTopK && total > 0.0f) {
-                const float invTotal = 1.0f / total;
+                const float invTotal = 1.0f / (total + (cfg.sigmoidRouter ? 1e-20f : 0.0f));
                 for (size_t j = 0; j < K; ++j) share[t * K + j] *= invTotal;
             }
+
+            for (size_t j = 0; j < K; ++j) share[t * K + j] *= cfg.routedScaling;
         }
 
         /*
@@ -2253,7 +3324,7 @@ struct LocalModel {
 
             apply(xg.data(), L.experts[e].gate, eg.data(), n, threaded);
             apply(xg.data(), L.experts[e].up,   eu.data(), n, threaded);
-            for (size_t i = 0; i < n * M; ++i) eg[i] = activation(eg[i]) * eu[i];
+            for (size_t i = 0; i < n * M; ++i) eg[i] = swiglu(eg[i], eu[i]);
             apply(eg.data(), L.experts[e].down, eo.data(), n, threaded);
 
             for (size_t r = 0; r < n; ++r) {
@@ -2303,14 +3374,31 @@ struct LocalModel {
                  LocalCache& cache, float* logitsOut, LocalTrace* trace = nullptr) const {
         const size_t H = cfg.hidden;
 
-        std::vector<float> x(count * H), h(count * H), proj(count * H);
+        /*
+            With hyper-connections the residual is S streams per token rather
+            than one, laid out [token][stream][hidden], and each half of a
+            layer reads them collapsed and writes back through hcExpand.
+            With S of one, x is the ordinary residual and both are skipped.
+        */
+        const size_t S = cfg.streams();
+        std::vector<float> x(count * S * H), h(count * H), proj(count * H);
+        std::vector<float> collapsed(S > 1 ? count * H : 0);
+        std::vector<float> post(S > 1 ? count * S : 0), comb(S > 1 ? count * S * S : 0);
 
         /* a mixture-of-experts layer sizes its own scratch per expert, so
-           the dense feed-forward buffers are not wanted at all */
-        const size_t ff = (spec.mlp == MLPKind::MoE) ? 0 : cfg.intermediate;
+           the dense feed-forward buffers are only wanted when some layer is
+           dense - which in GLM's case is the first three */
+        bool anyDense = spec.mlp != MLPKind::MoE;
+        for (const LocalLayer& L : layers) anyDense = anyDense || !L.moe;
+        const size_t ff = anyDense ? cfg.intermediate : 0;
         std::vector<float> gate(count * ff), up(count * ff);
 
-        for (size_t t = 0; t < count; ++t) widenRow(embed, ids[t], &x[t * H], H);
+        /* every stream starts as the same embedding */
+        for (size_t t = 0; t < count; ++t) {
+            float* first = &x[t * S * H];
+            widenRow(embed, ids[t], first, H);
+            for (size_t n = 1; n < S; ++n) std::copy(first, first + H, first + n * H);
+        }
 
         /* learned absolute positions are simply added into the stream; RoPE
            instead rotates Q and K further down, and touches nothing here */
@@ -2319,40 +3407,68 @@ struct LocalModel {
                 for (size_t i = 0; i < H; ++i)
                     x[t * H + i] += posEmbed.ptr[(startPos + t) * H + i];
 
-        if (trace) trace->add("embed", x.data(), count * H);
+        if (trace) trace->add("embed", x.data(), count * S * H);
+
+        /* the indexer's choice, kept from one latent-attention layer to the
+           next for the layers that share rather than run their own */
+        std::vector<KeySelection> selection;
 
         for (size_t l = 0; l < cfg.nLayer; ++l) {
             const LocalLayer& L = layers[l];
             const std::string tag = expandName(spec.tracePrefix, l);
 
+            const float* in = x.data();
+            if (S > 1) {
+                hcCollapse(x.data(), L.hcAttn, count, collapsed.data(), post.data(), comb.data());
+                in = collapsed.data();
+            }
+
             for (size_t t = 0; t < count; ++t)
-                normRow(&x[t * H], L.inputNorm, L.inputNormBias, &h[t * H], H);
+                normRow(&in[t * H], L.inputNorm, L.inputNormBias, &h[t * H], H);
             if (trace) trace->add(tag + "ln1", h.data(), count * H);
 
-            /* the only place the two layer kinds differ: everything either
-               side of this - the norms, the residual, the feed forward - is
+            /* the only place the layer kinds differ: everything either side
+               of this - the norms, the residual, the feed forward - is
                identical whichever mixer sits in the middle */
-            if (L.mixer == MixerKind::GatedDeltaNet)
-                gatedDeltaNetMixer(h.data(), L, l, count, cache, proj.data(), tag, trace);
-            else
-                attentionMixer(h.data(), L, l, count, startPos, cache,
-                               proj.data(), tag, trace);
+            switch (L.mixer) {
+                case MixerKind::GatedDeltaNet:
+                    gatedDeltaNetMixer(h.data(), L, l, count, cache, proj.data(), tag, trace);
+                    break;
+                case MixerKind::KimiDelta:
+                    kimiDeltaMixer(h.data(), L, l, count, cache, proj.data(), tag, trace);
+                    break;
+                case MixerKind::LatentAttention:
+                    latentAttentionMixer(h.data(), L, l, count, startPos, cache, selection,
+                                         proj.data(), tag, trace);
+                    break;
+                default:
+                    attentionMixer(h.data(), L, l, count, startPos, cache,
+                                   proj.data(), tag, trace);
+                    break;
+            }
 
-            for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
-            if (trace) trace->add(tag + "res1", x.data(), count * H);
+            if (S > 1) hcExpand(x.data(), proj.data(), post.data(), comb.data(), count);
+            else       for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
+            if (trace) trace->add(tag + "res1", x.data(), count * S * H);
+
+            in = x.data();
+            if (S > 1) {
+                hcCollapse(x.data(), L.hcFfn, count, collapsed.data(), post.data(), comb.data());
+                in = collapsed.data();
+            }
 
             for (size_t t = 0; t < count; ++t)
-                normRow(&x[t * H], L.postAttnNorm, L.postAttnNormBias, &h[t * H], H);
+                normRow(&in[t * H], L.postAttnNorm, L.postAttnNormBias, &h[t * H], H);
             if (trace) trace->add(tag + "ln2", h.data(), count * H);
 
-            if (spec.mlp == MLPKind::MoE) {
+            if (L.moe) {
                 moeBlock(h.data(), L, count, proj.data(), tag, trace);
             } else {
-                if (spec.mlp == MLPKind::SwiGLU) {
+                if (spec.mlp == MLPKind::SwiGLU || spec.mlp == MLPKind::MoE) {
                     apply(h.data(), L.gate, gate.data(), count);
                     apply(h.data(), L.up,   up.data(),   count);
                     for (size_t i = 0; i < count * cfg.intermediate; ++i)
-                        gate[i] = activation(gate[i]) * up[i];
+                        gate[i] = swiglu(gate[i], up[i]);
                 } else {
                     apply(h.data(), L.up, gate.data(), count);
                     if (trace) trace->add(tag + "fc", gate.data(), count * cfg.intermediate);
@@ -2365,14 +3481,20 @@ struct LocalModel {
                 if (trace) trace->add(tag + "mlpout", proj.data(), count * H);
             }
 
-            for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
-            if (trace) trace->add(tag + "res2", x.data(), count * H);
+            if (S > 1) hcExpand(x.data(), proj.data(), post.data(), comb.data(), count);
+            else       for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
+            if (trace) trace->add(tag + "res2", x.data(), count * S * H);
         }
 
         cache.length = startPos + count;
 
-        std::vector<float> last(H);
-        normRow(&x[(count - 1) * H], finalNorm, finalNormBias, last.data(), H);
+        /* the streams end as their plain mean, then the usual final norm */
+        std::vector<float> lastIn(H, 0.0f), last(H);
+        const float* lastRow = &x[(count - 1) * S * H];
+        for (size_t n = 0; n < S; ++n)
+            for (size_t i = 0; i < H; ++i) lastIn[i] += lastRow[n * H + i] / static_cast<float>(S);
+
+        normRow(lastIn.data(), finalNorm, finalNormBias, last.data(), H);
         if (trace) trace->add(spec.traceFinalNorm, last.data(), H);
 
         Weight head = lmHead;
@@ -2431,10 +3553,13 @@ struct LocalModel {
         None,           // a base model: prompt it as plain text
         ChatML,         // <|im_start|>role\n ... <|im_end|>
         ChatMLSep,      // the same but with <|im_sep|> between role and content
-        MistralInst     // [INST] ... [/INST]
+        MistralInst,    // [INST] ... [/INST]
+        GLM             // [gMASK]<sop> <|system|> ... <|user|> ... <|assistant|>
     };
 
     ChatFormat chatFormat() const {
+        if (tokenizer.hasSpecial("[gMASK]") && tokenizer.hasSpecial("<|assistant|>"))
+            return ChatFormat::GLM;
         if (tokenizer.hasSpecial("[INST]"))       return ChatFormat::MistralInst;
         if (tokenizer.hasSpecial("<|im_sep|>"))   return ChatFormat::ChatMLSep;
         if (tokenizer.hasSpecial("<|im_start|>")) return ChatFormat::ChatML;
@@ -2443,6 +3568,7 @@ struct LocalModel {
 
     const char* chatFormatName() const {
         switch (chatFormat()) {
+            case ChatFormat::GLM:         return "GLM";
             case ChatFormat::MistralInst: return "[INST]";
             case ChatFormat::ChatMLSep:   return "ChatML+sep";
             case ChatFormat::ChatML:      return "ChatML";
@@ -2465,9 +3591,34 @@ struct LocalModel {
           it is the behaviour it was taught, applied to a prompt that never
           said there is no repository and no tools to call
     */
+    /*
+        start: whether this prompt opens the sequence. Most formats put
+        nothing there that the system prompt does not already cover, but
+        GLM's [gMASK]<sop> belongs once at the very beginning and must not
+        reappear in a follow-up appended to a live cache.
+    */
     std::string chatPrompt(const std::string& user, bool thinking = false,
-                           const std::string& system = {}) const {
+                           const std::string& system = {}, bool start = true) const {
         switch (chatFormat()) {
+            case ChatFormat::GLM: {
+                /*
+                    What the official template renders. Its preamble names a
+                    reasoning effort, Max unless asked otherwise, and the
+                    generation prompt always opens a <think> block. With
+                    thinking off this asks for Low and hands over the block
+                    already closed - the same empty "<think></think>" the
+                    template writes into earlier turns that did no reasoning
+                */
+                std::string prompt;
+                if (start)
+                    prompt += std::string("[gMASK]<sop><|system|>Reasoning Effort: ")
+                            + (thinking ? "Max" : "Low");
+                if (!system.empty()) prompt += "<|system|>" + system;
+                prompt += "<|user|>" + user + "<|assistant|>";
+                prompt += thinking ? "<think>" : "<think></think>";
+                return prompt;
+            }
+
             case ChatFormat::MistralInst:
                 /* the format has no system role, and the convention is to
                    put it at the top of the first instruction block */
@@ -2513,6 +3664,8 @@ struct LocalModel {
     }
 
     bool isStop(size_t id) const {
+        for (size_t s : stopIds) if (id == s) return true;
+
         static const char* ENDS[] = {"<|im_end|>", "<|endoftext|>", "</s>", "<|end|>"};
         for (const char* e : ENDS)
             if (tokenizer.hasSpecial(e) && id == tokenizer.idFor(e)) return true;

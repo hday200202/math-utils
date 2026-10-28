@@ -193,6 +193,32 @@ inline void matmulNTBF16(const float* A, const uint16_t* B, float* C,
 }
 
 
+/*
+    matmulNTFP8(A, W, C, ...):
+    - the same against FP8 weights with a scale per tile. Each weight row is
+      decoded into a scratch row once - every code through the table, times
+      its tile's scale - and then dotted against every row of A, so a prompt
+      pays for the decode once per weight row rather than once per token.
+    - the scratch is per call of the body, so each thread has its own and
+      nothing is shared between them
+*/
+inline void matmulNTFP8(const float* A, const quant::Fp8Tensor& W, float* C,
+                        size_t M, size_t K, size_t N, bool threaded = true) {
+    const auto body = [&](size_t begin, size_t end) {
+        std::vector<float> row(K);
+        for (size_t j = begin; j < end; ++j) {
+            W.dequantRow(j, row.data());
+            for (size_t i = 0; i < M; ++i)
+                C[i * N + j] = dot(A + i * K, row.data(), K);
+        }
+    };
+
+    if (!threaded || N < 512) { body(0, N); return; }
+
+    Pool::instance().run(N, body);
+}
+
+
 inline void matmulNTBias(const float* A, const float* B, const float* bias, float* C,
                          size_t M, size_t K, size_t N, bool threaded = true) {
     const auto body = [&](size_t begin, size_t end) {

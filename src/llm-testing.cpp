@@ -5,7 +5,9 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../include/ai/LocalModel.hpp"
@@ -87,6 +89,123 @@ static void testRegistry() {
           == "model.layers.7.mlp.up_proj.weight");
     check("a template without {L} is unchanged",
           ai::expandName("model.norm.weight", 3) == "model.norm.weight");
+
+    const ai::ArchSpec* glm = ai::specFor("glm5_next");
+    check("glm5_next is known", glm != nullptr && ai::specFor("glm5_next_text") != nullptr);
+    check("glm5_next's linear layers are Kimi Delta Attention",
+          glm->linearMixer == ai::MixerKind::KimiDelta);
+    check("glm5_next's other layers are latent attention",
+          glm->attentionMixer == ai::MixerKind::LatentAttention);
+    check("glm5_next reads past the vision tower", [&] {
+        for (const std::string& p : glm->skipPrefixes) if (p == "model.visual.") return true;
+        return false;
+    }());
+}
+
+
+/* ========================================================================= //
+    FP8
+    The decode is a table built from the bit layout, so it is checked against
+    values worked out by hand rather than against itself. The tile scales are
+    checked by putting a different scale in each tile and reading it back.
+// ========================================================================= */
+
+/* ========================================================================= //
+    CPU selection and the claims file
+// ========================================================================= */
+
+static void testCores() {
+    section("cores");
+
+    std::vector<size_t> cpus;
+    std::string error;
+    check("a list with ranges parses",
+          ai::cores::parseList("0-3, 8,10-11", cpus, error)
+          && cpus == std::vector<size_t>({0, 1, 2, 3, 8, 10, 11}));
+    check("repeats and order do not matter",
+          ai::cores::parseList("5,1-2,2", cpus, error) && cpus == std::vector<size_t>({1, 2, 5}));
+    check("a backwards range is rejected", !ai::cores::parseList("7-3", cpus, error));
+    check("junk is rejected", !ai::cores::parseList("0-x", cpus, error));
+    check("format folds runs back into ranges",
+          ai::cores::format({11, 0, 1, 2, 3, 8, 10}) == "0-3,8,10-11");
+
+    const std::vector<size_t> usable = ai::cores::allowed();
+    check("this process may run on at least one CPU (" + ai::cores::format(usable) + ")",
+          !usable.empty());
+    check("\"all\" is every allowed CPU", ai::cores::parse("all", cpus, error) && cpus == usable);
+    check("a CPU that is not there is refused",
+          !ai::cores::parse(std::to_string(usable.back() + 100000), cpus, error));
+
+    /* on a thread of its own: threads inherit their creator's affinity on
+       Linux, so pinning this one would squeeze every later test onto a core */
+    bool pinned = false;
+    std::thread([&] { pinned = ai::cores::pinCurrentThread(usable.back()); }).join();
+    check("a thread can be pinned to an allowed CPU", pinned);
+
+    check("this process is seen as running",
+          ai::cores::processStamp(ai::cores::selfPid()) != 0);
+
+    const fs::path file = fs::temp_directory_path() / "llm-testing-cores.txt";
+    std::error_code ec;
+    fs::remove(file, ec);
+    {
+        /* a line left by a process that is long gone, as a killed run leaves */
+        std::ofstream(file) << "999999999 12345 0-3 dead-model\n";
+
+        ai::cores::Registry registry(file);
+        std::vector<size_t> taken;
+        size_t othersSeen = 99;
+        const bool ok = registry.claim([&](const std::vector<ai::cores::Claim>& others) {
+            othersSeen = others.size();
+            return std::vector<size_t>{usable.front()};
+        }, "test model", taken, error);
+
+        check("a claim is recorded", ok && taken == std::vector<size_t>{usable.front()});
+        check("a dead process's claim is ignored", othersSeen == 0);
+
+        std::ifstream in(file);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        check("the file names this process and drops the dead one",
+              text.find(std::to_string(ai::cores::selfPid()) + " ") != std::string::npos
+              && text.find("dead-model") == std::string::npos);
+    }
+    check("the claim is released on the way out", !fs::exists(file));
+    check("no lock is left behind", !fs::exists(file.string() + ".lock"));
+}
+
+
+static void testFp8() {
+    section("fp8");
+
+    const float* t = ai::quant::fp8Table();
+    check("0x38 is 1.0",          t[0x38] == 1.0f);
+    check("0x3C is 1.5",          t[0x3C] == 1.5f);
+    check("0xB8 is -1.0",         t[0xB8] == -1.0f);
+    check("0x7E is 448, the max", t[0x7E] == 448.0f);
+    check("0x08 is 2^-6, the smallest normal", t[0x08] == 0.015625f);
+    check("0x01 is 2^-9, the smallest subnormal", t[0x01] == 0.001953125f);
+    check("0x7F is NaN",          std::isnan(t[0x7F]));
+
+    // a 4x4 matrix of 1.0 in 2x2 tiles, each tile scaled differently
+    std::shared_ptr<uint8_t[]> codes(new uint8_t[16]);
+    for (size_t i = 0; i < 16; ++i) codes[i] = 0x38;
+    std::shared_ptr<float[]> scales(new float[4]{1.0f, 2.0f, 3.0f, 4.0f});
+    const ai::quant::Fp8Tensor w = ai::quant::makeFp8(codes, 4, 4, scales, 2, 2);
+
+    float row[4];
+    w.dequantRow(3, row);
+    check("a row picks up the scale of each tile it crosses",
+          row[0] == 3.0f && row[1] == 3.0f && row[2] == 4.0f && row[3] == 4.0f);
+
+    const float x[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float y[4];
+    ai::kernels::matmulNTFP8(x, w, y, 1, 4, 4, false);
+    check("the FP8 matmul sums the scaled weights",
+          y[0] == 6.0f && y[1] == 6.0f && y[2] == 14.0f && y[3] == 14.0f);
+
+    const ai::quant::Fp8Tensor bare = ai::quant::makeFp8(codes, 4, 4, nullptr, 0, 0);
+    bare.dequantRow(0, row);
+    check("FP8 without a scale tensor is unscaled", row[0] == 1.0f && row[3] == 1.0f);
 }
 
 
@@ -861,6 +980,8 @@ int main(int argc, char** argv) {
     const std::string qwenOracle = argc > 4 ? argv[4] : "out/qwen-oracle";
 
     testRegistry();
+    testCores();
+    testFp8();
     testGPT2(gpt2Dir, gpt2Oracle);
     testQwen3(qwenDir, qwenOracle);
     testQwen3Next(argc > 5 ? argv[5] : "models/tiny-qwen3next",

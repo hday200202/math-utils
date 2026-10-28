@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <cstdio>
@@ -8,7 +9,9 @@
 #include <vector>
 
 #include "../include/platform/Console.hpp"
+#include "../include/platform/ExeDir.hpp"
 #include "../include/platform/Memory.hpp"
+#include "../include/ai/Cores.hpp"
 #include "../include/ai/LocalModel.hpp"
 
 /*
@@ -109,6 +112,11 @@ static void usage() {
         << "  --q8 / --q4  quantise the weight matrices as they load, so a model\n"
         << "               too large to hold in bfloat16 still fits. About half\n"
         << "               the size for q8, under a third for q4.\n"
+        << "  --cores C    which CPUs to run on, one pinned thread each: a list such\n"
+        << "               as 0-31 or 0-15,32-47, \"all\", or \"auto\" (the default) for\n"
+        << "               every CPU no other running llm has claimed. Claims are\n"
+        << "               kept in llm-cores.txt beside this executable, so a second\n"
+        << "               instance started with auto stays off the first one's CPUs.\n"
         << "\n"
         << "  <model-dir>  a folder holding config.json, the .safetensors,\n"
         << "               and a tokenizer. The architecture is read from\n"
@@ -221,6 +229,7 @@ int main(int argc, char** argv) {
     double vramCapGB = 0.0;
     std::string systemPrompt = DEFAULT_SYSTEM;
     std::string effort;            // empty = do not think at all
+    std::string coresSpec = "auto";
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -238,6 +247,7 @@ int main(int argc, char** argv) {
         else if (arg == "--system" && hasNext)  { systemPrompt = argv[++i]; }
         else if (arg == "--no-system")          { systemPrompt.clear(); }
         else if (arg == "--effort" && hasNext)   { effort = argv[++i]; }
+        else if (arg == "--cores"  && hasNext)  { coresSpec = argv[++i]; }
         else if (arg == "--force")              { force = true; }
         else if (arg == "--random") {
             random = true;
@@ -281,6 +291,81 @@ int main(int argc, char** argv) {
         if (!line.empty())
             systemPrompt = systemPrompt.empty() ? line : line + "\n\n" + systemPrompt;
     }
+
+    /*
+        Decide the CPUs before anything touches the thread pool: it is built
+        once, on first use, with whatever it was configured for by then.
+
+        An explicit list is taken as given - overlapping another instance is
+        allowed, it is only warned about. auto takes what the others have
+        not claimed, and falls back to sharing everything rather than
+        refusing to run when nothing is left. Choosing and recording happen
+        under one lock inside the registry, so two instances started at
+        once cannot both take the same free CPUs.
+
+        The registry lives for the rest of main and removes this process's
+        line on the way out. A run that is killed instead leaves a line
+        that the next reader sees is dead and drops.
+    */
+    std::vector<size_t> explicitCpus;
+    if (coresSpec != "auto") {
+        std::string error;
+        if (!ai::cores::parse(coresSpec, explicitCpus, error)) {
+            std::cout << "--cores " << coresSpec << ": " << error << "\n";
+            return 1;
+        }
+    }
+
+    ai::cores::Registry registry(platform::exeDir() / "llm-cores.txt");
+    std::vector<size_t> cpus;
+    std::string coresNote;
+    {
+        std::string error;
+        const bool recorded = registry.claim(
+            [&](const std::vector<ai::cores::Claim>& others) {
+                std::vector<size_t> held;
+                for (const ai::cores::Claim& c : others)
+                    held.insert(held.end(), c.cpus.begin(), c.cpus.end());
+                std::sort(held.begin(), held.end());
+
+                const auto overlaps = [&](const std::vector<size_t>& mine) {
+                    for (size_t c : mine)
+                        if (std::binary_search(held.begin(), held.end(), c)) return true;
+                    return false;
+                };
+
+                if (!explicitCpus.empty()) {
+                    if (overlaps(explicitCpus))
+                        coresNote = "warning: some of these CPUs are also claimed by another "
+                                    "running llm; both will run slower";
+                    return explicitCpus;
+                }
+
+                std::vector<size_t> free;
+                for (size_t c : ai::cores::allowed())
+                    if (!std::binary_search(held.begin(), held.end(), c)) free.push_back(c);
+
+                if (free.empty()) {
+                    coresNote = "warning: every CPU is claimed by another running llm, so "
+                                "this one shares all of them. Give each a --cores list";
+                    return ai::cores::allowed();
+                }
+                if (!held.empty())
+                    coresNote = "CPUs " + ai::cores::format(held)
+                              + " are claimed by another running llm; using the rest";
+                return free;
+            },
+            modelDir, cpus, error);
+
+        if (!recorded) {
+            /* an unwritable folder costs the coordination, not the run */
+            std::cout << "note: could not record the CPUs in use (" << error << ")\n";
+            if (cpus.empty()) cpus = explicitCpus.empty() ? ai::cores::allowed() : explicitCpus;
+        }
+    }
+
+    if (!coresNote.empty()) std::cout << coresNote << "\n";
+    ai::kernels::Pool::configure(cpus);
 
     using clock = std::chrono::steady_clock;
 
@@ -486,7 +571,12 @@ int main(int argc, char** argv) {
               << "  weights      " << ai::quant::typeName(model.quantType)
                                    << ", " << (model.weights.residentBytes() / (1024 * 1024))
                                    << " MB resident\n"
-              << "  threads      " << ai::kernels::Pool::instance().size() << "\n"
+              << "  threads      " << ai::kernels::Pool::instance().size()
+                                   << " on CPUs " << ai::cores::format(cpus)
+                                   << (ai::kernels::Pool::unpinned()
+                                           ? "  (" + std::to_string(ai::kernels::Pool::unpinned())
+                                             + " could not be pinned)"
+                                           : std::string()) << "\n"
               << "  device       " << deviceLine << "\n"
               << "  chat format  " << model.chatFormatName() << "\n"
               << "  context      " << context << "\n"
@@ -542,7 +632,7 @@ int main(int argc, char** argv) {
             const bool first = (cache.length == 0);
             const std::string text = chat
                 ? model.chatPrompt(userText, !effort.empty(),
-                                   first ? systemPrompt : std::string())
+                                   first ? systemPrompt : std::string(), first)
                 : userText;
             return model.tokenizer.encode(text, first);
         };

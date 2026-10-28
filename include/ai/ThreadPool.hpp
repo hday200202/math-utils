@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include "Cores.hpp"
+
 /*
     A persistent pool, in its own header so that both the matmul kernels and
     the quantiser can use it. Threads are created once and parked; spawning
@@ -32,6 +34,28 @@ public:
         static Pool pool;
         return pool;
     }
+
+    /*
+        configure(cpus):
+        - one thread per listed CPU, each pinned to its own: the caller to
+          the first, a worker to each of the rest. Has to come before
+          anything calls instance(), since the pool is built once; returns
+          false if it is too late.
+        - without it the pool is one unpinned thread per hardware thread,
+          which is what every program that never asks still gets
+    */
+    static bool configure(const std::vector<size_t>& cpus) {
+        if (started() || cpus.empty()) return false;
+        planned() = cpus;
+        if (!cores::pinCurrentThread(cpus[0])) pinFailures().fetch_add(1);
+        return true;
+    }
+
+    /* the CPUs the pool was configured for; empty means unpinned */
+    static const std::vector<size_t>& cpus() { return planned(); }
+
+    /* threads that could not be pinned where they were asked to go */
+    static size_t unpinned() { return pinFailures().load(); }
 
     size_t size() const { return m_workers.size() + 1; }
 
@@ -77,12 +101,29 @@ public:
 
 private:
     Pool() {
+        started() = true;
+        const std::vector<size_t>& cpus = planned();
+
+        if (!cpus.empty()) {
+            /* the caller already sits on cpus[0]; a worker for each of the rest */
+            for (size_t i = 1; i < cpus.size(); ++i)
+                m_workers.emplace_back([this, cpu = cpus[i]] {
+                    if (!cores::pinCurrentThread(cpu)) pinFailures().fetch_add(1);
+                    worker();
+                });
+            return;
+        }
+
         unsigned hardware = std::thread::hardware_concurrency();
         if (hardware == 0) hardware = 1;
 
         for (unsigned i = 1; i < hardware; ++i)
             m_workers.emplace_back([this] { worker(); });
     }
+
+    static bool& started()                        { static bool s = false; return s; }
+    static std::vector<size_t>& planned()         { static std::vector<size_t> c; return c; }
+    static std::atomic<size_t>& pinFailures()     { static std::atomic<size_t> n{0}; return n; }
 
     ~Pool() {
         {

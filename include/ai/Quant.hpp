@@ -1,9 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -95,6 +98,122 @@ inline float widenBF16(uint16_t h) {
     return std::bit_cast<float>(static_cast<uint32_t>(h) << 16);
 }
 
+/* the quantiser reads either a bfloat16 checkpoint or floats that were
+   already widened, which is what an FP8 one has to become first */
+inline float widenSource(uint16_t h) { return widenBF16(h); }
+inline float widenSource(float f)    { return f; }
+
+
+/* ========================================================================= //
+    FP8
+
+    Some checkpoints ship their big matrices as 8-bit floats rather than
+    bfloat16: E4M3, one sign bit, four of exponent and three of mantissa. The
+    range is tiny - the largest value is 448 - so the format is never used
+    bare. Every 128x128 tile of the matrix carries a float scale of its own,
+    stored alongside as a separate tensor named <weight>_scale_inv, and the
+    real weight is the code times the scale of the tile it sits in.
+
+    The name says inverse but the value is not: it is what the code is
+    MULTIPLIED by. It is the inverse of the scale that was divided out when
+    the checkpoint was written, which is the writer's point of view.
+// ========================================================================= */
+
+/*
+    fp8E4M3ToFloat(code):
+    - exponent bias 7. An exponent of zero is subnormal, the mantissa then
+      counting in steps of 2^-9 with no implied leading one. E4M3 spends the
+      all-ones pattern on NaN alone and has no infinities, which is how it
+      reaches 448 rather than 240
+*/
+constexpr float fp8E4M3ToFloat(uint8_t code) {
+    const bool     negative = (code & 0x80u) != 0;
+    const uint32_t exponent = (code >> 3) & 0x0Fu;
+    const uint32_t mantissa = code & 0x07u;
+
+    float magnitude = 0.0f;
+    if (exponent == 0x0Fu && mantissa == 0x07u) {
+        magnitude = std::numeric_limits<float>::quiet_NaN();
+    } else if (exponent == 0) {
+        magnitude = static_cast<float>(mantissa) / 512.0f;              // m * 2^-9
+    } else {
+        float power = 1.0f;                                             // 2^(e - 7)
+        for (uint32_t e = exponent; e > 7; --e) power *= 2.0f;
+        for (uint32_t e = exponent; e < 7; ++e) power *= 0.5f;
+        magnitude = power * (1.0f + static_cast<float>(mantissa) / 8.0f);
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+/* all 256 codes decoded once. Decoding is then one load from a table that
+   sits in L1, which is cheaper than the arithmetic and cannot get it wrong */
+inline const float* fp8Table() {
+    static const auto table = [] {
+        std::array<float, 256> t{};
+        for (size_t i = 0; i < 256; ++i) t[i] = fp8E4M3ToFloat(static_cast<uint8_t>(i));
+        return t;
+    }();
+    return table.data();
+}
+
+/*
+    Fp8Tensor:
+    - an [out, in] matrix of E4M3 codes, aliasing the checkpoint's bytes, and
+      the grid of tile scales that goes with it.
+    - the tile shape is derived from the two shapes rather than assumed:
+      a [4096, 12288] weight with a [32, 96] scale grid is 128x128 tiles
+*/
+struct Fp8Tensor {
+    std::shared_ptr<uint8_t[]> codes;
+    std::shared_ptr<float[]>   scales;
+    size_t outDim = 0, inDim = 0;
+    size_t scaleRows = 1, scaleCols = 1;
+    size_t tileOut = 0, tileIn = 0;
+
+    bool valid() const { return codes != nullptr && scales != nullptr && outDim && inDim; }
+
+    /* one row of real weights: every code times its tile's scale */
+    void dequantRow(size_t row, float* out) const {
+        const float*   table = fp8Table();
+        const uint8_t* src   = codes.get() + row * inDim;
+        const float*   srow  = scales.get() + (row / tileOut) * scaleCols;
+
+        for (size_t c = 0; c < scaleCols; ++c) {
+            const size_t begin = c * tileIn;
+            const size_t end   = std::min(begin + tileIn, inDim);
+            const float  s     = srow[c];
+            for (size_t i = begin; i < end; ++i) out[i] = table[src[i]] * s;
+        }
+    }
+};
+
+/*
+    makeFp8(codes, outDim, inDim, scales, scaleRows, scaleCols):
+    - puts the pieces together, working out the tile from the two shapes.
+      A checkpoint with no scale tensor at all is plain unscaled FP8, which
+      is one tile covering the whole matrix with a scale of one
+*/
+inline Fp8Tensor makeFp8(std::shared_ptr<uint8_t[]> codes, size_t outDim, size_t inDim,
+                         std::shared_ptr<float[]> scales, size_t scaleRows, size_t scaleCols) {
+    Fp8Tensor t;
+    t.codes  = std::move(codes);
+    t.outDim = outDim;
+    t.inDim  = inDim;
+
+    if (!scales || scaleRows == 0 || scaleCols == 0) {
+        t.scales = std::shared_ptr<float[]>(new float[1]{1.0f});
+        scaleRows = scaleCols = 1;
+    } else {
+        t.scales = std::move(scales);
+    }
+
+    t.scaleRows = scaleRows;
+    t.scaleCols = scaleCols;
+    t.tileOut   = (outDim + scaleRows - 1) / scaleRows;
+    t.tileIn    = (inDim  + scaleCols - 1) / scaleCols;
+    return t;
+}
+
 /*
     quantizeRow(src, out, scales, inDim, type):
     - symmetric, so zero maps to zero exactly and no zero-point is needed.
@@ -105,16 +224,17 @@ inline float widenBF16(uint16_t h) {
       so the stored range 0..15 covers -8..7. See the Q4 branch for why the
       scale and the pairing are both chosen the way they are
 */
-inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
+template <typename Src>
+inline void quantizeRow(const Src* src, int8_t* out, float* scales,
                         size_t inDim, Type type) {
     const size_t blocks = inDim / BLOCK;
 
     for (size_t b = 0; b < blocks; ++b) {
-        const uint16_t* in = src + b * BLOCK;
+        const Src* in = src + b * BLOCK;
 
         float amax = 0.0f, extreme = 0.0f;
         for (size_t j = 0; j < BLOCK; ++j) {
-            const float v = widenBF16(in[j]);
+            const float v = widenSource(in[j]);
             if (std::fabs(v) > amax) { amax = std::fabs(v); extreme = v; }
         }
 
@@ -125,7 +245,7 @@ inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
 
             int8_t* dst = out + b * BLOCK;
             for (size_t j = 0; j < BLOCK; ++j) {
-                const int v = static_cast<int>(std::lround(widenBF16(in[j]) * inv));
+                const int v = static_cast<int>(std::lround(widenSource(in[j]) * inv));
                 dst[j] = static_cast<int8_t>(std::clamp(v, -127, 127));
             }
         } else {
@@ -172,9 +292,9 @@ inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
             int8_t* dst = out + b * HALF;
             for (size_t j = 0; j < HALF; ++j) {
                 const int lo = std::clamp(
-                    static_cast<int>(std::lround(widenBF16(in[j]) * inv)) + 8, 0, 15);
+                    static_cast<int>(std::lround(widenSource(in[j]) * inv)) + 8, 0, 15);
                 const int hi = std::clamp(
-                    static_cast<int>(std::lround(widenBF16(in[j + HALF]) * inv)) + 8, 0, 15);
+                    static_cast<int>(std::lround(widenSource(in[j + HALF]) * inv)) + 8, 0, 15);
                 dst[j] = static_cast<int8_t>((hi << 4) | lo);
             }
         }
@@ -184,11 +304,13 @@ inline void quantizeRow(const uint16_t* src, int8_t* out, float* scales,
 
 /*
     quantize(src, outDim, inDim, type):
-    - takes a bfloat16 [out, in] matrix and returns its quantised form.
-      Returns an invalid tensor when the row length is not a multiple of the
-      block size, so the caller can fall back rather than silently truncating
+    - takes a bfloat16 (or float) [out, in] matrix and returns its quantised
+      form. Returns an invalid tensor when the row length is not a multiple
+      of the block size, so the caller can fall back rather than silently
+      truncating
 */
-inline QuantTensor quantize(const uint16_t* src, size_t outDim, size_t inDim, Type type) {
+template <typename Src>
+inline QuantTensor quantize(const Src* src, size_t outDim, size_t inDim, Type type) {
     QuantTensor out;
     if (type == Type::None || inDim % BLOCK != 0) return out;
 

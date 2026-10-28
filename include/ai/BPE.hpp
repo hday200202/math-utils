@@ -118,6 +118,21 @@ struct Tokenizer {
     */
     std::vector<size_t>                      prefixIds, suffixIds;
 
+    /*
+        How many digits one pre-token may hold. Qwen splits numbers into
+        single digits; the cl100k-style pattern GLM uses says \p{N}{1,3}, so
+        1234 is "123" and "4". The rest of the two patterns is identical.
+    */
+    size_t                                   digitRun = 1;
+
+    /*
+        ignore_merges: a pre-token that is already a whole vocabulary entry
+        is emitted as that entry without running the merges. Usually the
+        merges would arrive at the same place anyway; "usually" is the
+        problem, because when they do not the ids differ from the reference
+    */
+    bool                                     ignoreMerges = false;
+
     /* Metaspace only: U+2581 as UTF-8, and whether a leading one is added */
     std::string                              metaspaceMark = "\xe2\x96\x81";
     bool                                     prependMark = true;
@@ -255,6 +270,17 @@ struct Tokenizer {
             prependMark = pre["prepend_scheme"].asString("first") != "never";
         }
         byteFallback = model["byte_fallback"].asBool(false);
+        ignoreMerges = model["ignore_merges"].asBool(false);
+
+        /* the split pattern sits either at the top or inside a Sequence */
+        const auto readSplit = [&](const files::json::Value& p) {
+            if (p["type"].asString() != "Split") return;
+            if (p["pattern"]["Regex"].asString().find("\\p{N}{1,3}") != std::string::npos)
+                digitRun = 3;
+        };
+        readSplit(pre);
+        const files::json::Value& steps = pre["pretokenizers"];
+        for (size_t i = 0; i < steps.size(); ++i) readSplit(steps[i]);
 
         /*
             post_processor says what wraps a sequence. TemplateProcessing's
@@ -351,8 +377,10 @@ struct Tokenizer {
           insensitively, and DIGITS ARE SPLIT ONE AT A TIME rather than in
           runs, so 1234 becomes four tokens. The prefix a word may absorb is
           also any non-letter non-digit, not only a space
+        - maxDigits relaxes the second: GLM's pattern is otherwise the same
+          and takes digits up to three at a time
     */
-    static std::vector<std::string> preTokenizeQwen(std::string_view text) {
+    static std::vector<std::string> preTokenizeQwen(std::string_view text, size_t maxDigits = 1) {
         static const char* CONTRACTIONS[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
 
         auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
@@ -384,7 +412,13 @@ struct Tokenizer {
                 continue;
             }
 
-            if (isDigit(text[i])) { out.emplace_back(text.substr(i, 1)); ++i; continue; }
+            if (isDigit(text[i])) {
+                j = i;
+                while (j < text.size() && j - i < maxDigits && isDigit(text[j])) ++j;
+                out.emplace_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
 
             j = i;
             if (text[j] == ' ') ++j;
@@ -531,7 +565,7 @@ struct Tokenizer {
 
 
     std::vector<std::string> preTokenize(std::string_view text) const {
-        return style == PreTokenizer::Qwen ? preTokenizeQwen(text) : preTokenizeGPT2(text);
+        return style == PreTokenizer::Qwen ? preTokenizeQwen(text, digitRun) : preTokenizeGPT2(text);
     }
 
 
@@ -636,6 +670,11 @@ struct Tokenizer {
         for (const std::string& chunk : preTokenize(text)) {
             std::string mapped;
             for (char c : chunk) mapped += byteToUnicode[static_cast<unsigned char>(c)];
+
+            if (ignoreMerges) {
+                auto whole = encoder.find(mapped);
+                if (whole != encoder.end()) { ids.push_back(static_cast<size_t>(whole->second)); continue; }
+            }
 
             for (const std::string& piece : bpe(mapped)) {
                 auto found = encoder.find(piece);

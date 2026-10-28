@@ -272,6 +272,7 @@ struct Safetensors {
         if (dtype == "I64")  return 8;
         if (dtype == "I32")  return 4;
         if (dtype == "I16")  return 2;
+        if (dtype == "F8_E4M3") return 1;
         if (dtype == "I8")   return 1;
         if (dtype == "U8")   return 1;
         if (dtype == "BOOL") return 1;
@@ -379,6 +380,14 @@ struct Safetensors {
             return out;
         }
 
+        /* the codes alone. An FP8 weight also needs its tile scales, which
+           live in another tensor - ModelWeights::widenScaled applies them */
+        if (info.dtype == "F8_E4M3") {
+            const float* table = quant::fp8Table();
+            for (size_t i = 0; i < n; ++i) out.ptr[i] = table[base[i]];
+            return out;
+        }
+
         // integer payloads are not weights; widen them so shapes still line up
         for (size_t i = 0; i < n; ++i) out.ptr[i] = 0.0f;
         return out;
@@ -413,6 +422,22 @@ struct Safetensors {
         Tensor<uint16_t> copy(meta->shape);
         std::memcpy(copy.ptr, base, meta->byteCount());
         return copy;
+    }
+
+
+    /* rawFP8(name): the same for an E4M3 tensor. A byte needs no alignment */
+    Tensor<uint8_t> rawFP8(const std::string& name) const {
+        const TensorInfo* meta = info(name);
+        if (!meta || !blob || meta->dtype != "F8_E4M3") return Tensor<uint8_t>();
+
+        uint8_t* typed = reinterpret_cast<uint8_t*>(blob->data()) + payloadBegin + meta->begin;
+
+        Tensor<uint8_t> out;
+        out.shape   = meta->shape;
+        out.strides = Tensor<uint8_t>::defaultStrides(out.shape);
+        out.storage = std::shared_ptr<uint8_t[]>(blob, typed);
+        out.ptr     = typed;
+        return out;
     }
 
 
@@ -538,6 +563,7 @@ struct ModelWeights {
         size_t tensorAt = NONE;         // slot in tensors
         size_t rawAt    = NONE;         // slot in raw
         size_t quantAt  = NONE;         // slot in quantized
+        size_t fp8At    = NONE;         // slot in fp8
     };
 
     std::vector<Safetensors>                    shards;
@@ -573,6 +599,22 @@ struct ModelWeights {
     */
     quant::Type                                 quantType = quant::Type::None;
     std::vector<std::pair<std::string, quant::QuantTensor>> quantized;
+
+    /*
+        FP8 matrices kept as they are on disk: the codes alias the file bytes
+        just as a bfloat16 weight does, at half the size again.
+    */
+    std::vector<std::pair<std::string, Tensor<uint8_t>>> fp8;
+
+    /*
+        The tile scales of every FP8 weight, keyed by the WEIGHT's name, read
+        before anything else. They have to be: a weight and its scale tensor
+        are separate entries that need not even sit in the same shard, and
+        the streaming loader converts each weight the moment it reads it, so
+        the scale has to be in hand by then. All of them together are a few
+        tens of megabytes against hundreds of gigabytes of codes.
+    */
+    std::unordered_map<std::string, Tensor<float>> blockScales;
 
     /*
         releaseUnreferenced():
@@ -670,7 +712,20 @@ struct ModelWeights {
         */
         if (endsWith(name, ".mlp.gate.weight")) return false;
 
-        return info.dtype == "BF16"
+        /*
+            The same argument for the other small matrices whose outputs
+            choose rather than compute. A hyper-connection's projection goes
+            through a softmax and twenty rounds of Sinkhorn normalisation to
+            become the weights that mix the residual streams, and an
+            attention indexer picks which tokens a layer gets to see at all.
+            kv_b_proj is widened to float at load anyway, so rounding it on
+            the way would be pure loss.
+        */
+        if (name.find(".hc_") != std::string::npos
+            || name.find(".indexer.") != std::string::npos
+            || endsWith(name, ".kv_b_proj.weight")) return false;
+
+        return (info.dtype == "BF16" || info.dtype == "F8_E4M3")
             && info.shape.size() == 2
             && info.numel() >= 65536
             && info.shape[1] % quant::BLOCK == 0;
@@ -688,6 +743,8 @@ struct ModelWeights {
         tensors.clear();
         raw.clear();
         quantized.clear();
+        fp8.clear();
+        blockScales.clear();
         widen = widenToFloat;
         quantType = quantise;
 
@@ -734,6 +791,9 @@ struct ModelWeights {
             onto the file bytes, so those bytes have to stay.
         */
         const bool stream = (quantType != quant::Type::None) || synthesise || perturb;
+
+        /* nothing is read when every value is synthesised, scales included */
+        if (!synthesise && !loadBlockScales(directory, files)) return false;
 
         for (size_t i = 0; i < files.size(); ++i) {
             std::error_code ec;
@@ -803,18 +863,34 @@ struct ModelWeights {
 
                     if (worthQuantizing(e.first, e.second)) {
                         slot.quantAt = quantized.size();
-                        quantized.emplace_back(e.first,
-                            quant::quantize(reinterpret_cast<const uint16_t*>(bytes),
-                                            e.second.shape[0], e.second.shape[1], quantType));
+                        if (e.second.dtype == "F8_E4M3") {
+                            /* FP8 has to become real values, tile scales and
+                               all, before it can be cut into blocks of 32 */
+                            const Tensor<float> wide = widenScaled(e.first, e.second, bytes);
+                            quantized.emplace_back(e.first,
+                                quant::quantize(wide.ptr, e.second.shape[0],
+                                                e.second.shape[1], quantType));
+                        } else {
+                            quantized.emplace_back(e.first,
+                                quant::quantize(reinterpret_cast<const uint16_t*>(bytes),
+                                                e.second.shape[0], e.second.shape[1], quantType));
+                        }
                     } else {
                         // everything else stays float: small, worth the bits
                         slot.tensorAt = tensors.size();
-                        tensors.emplace_back(e.first,
-                                             Safetensors::widenFrom(e.second, bytes));
+                        tensors.emplace_back(e.first, widenScaled(e.first, e.second, bytes));
                     }
                 } else if (widen) {
                     slot.tensorAt = tensors.size();
-                    tensors.emplace_back(e.first, shards[i].tensor(e.first));
+                    if (e.second.dtype == "F8_E4M3")
+                        tensors.emplace_back(e.first, widenScaled(e.first, e.second,
+                            reinterpret_cast<const uint8_t*>(shards[i].blob->data())
+                                + shards[i].payloadBegin + e.second.begin));
+                    else
+                        tensors.emplace_back(e.first, shards[i].tensor(e.first));
+                } else if (e.second.dtype == "F8_E4M3") {
+                    slot.fp8At = fp8.size();
+                    fp8.emplace_back(e.first, shards[i].rawFP8(e.first));
                 } else {
                     slot.rawAt = raw.size();
                     raw.emplace_back(e.first, shards[i].rawBF16(e.first));
@@ -870,7 +946,7 @@ struct ModelWeights {
         }
 
         if (source) {
-            Tensor<float> real = Safetensors::widenFrom(info, source);
+            Tensor<float> real = widenScaled(name, info, source);
             std::copy(real.ptr, real.ptr + n, values.data());
         }
 
@@ -965,6 +1041,93 @@ struct ModelWeights {
                                          : quant::QuantTensor();
     }
 
+    /* an FP8 matrix kept as codes, with its tile scales attached */
+    quant::Fp8Tensor fp8Tensor(const std::string& name) const {
+        const Slot* s = slot(name);
+        if (!s || s->fp8At == NONE) return quant::Fp8Tensor();
+
+        const Tensor<uint8_t>& codes = fp8[s->fp8At].second;
+        if (!codes.storage || codes.shape.size() != 2) return quant::Fp8Tensor();
+
+        const auto found = blockScales.find(name);
+        if (found == blockScales.end() || found->second.shape.size() != 2)
+            return quant::makeFp8(codes.storage, codes.shape[0], codes.shape[1], nullptr, 0, 0);
+
+        const Tensor<float>& sc = found->second;
+        return quant::makeFp8(codes.storage, codes.shape[0], codes.shape[1],
+                              sc.storage, sc.shape[0], sc.shape[1]);
+    }
+
+
+    /*
+        widenScaled(name, info, bytes):
+        - a tensor as real floats. For everything but FP8 that is the plain
+          widening; an FP8 weight also has each of its tiles multiplied by
+          the scale stored for it, without which every value is off by a
+          factor that changes from tile to tile
+    */
+    Tensor<float> widenScaled(const std::string& name, const TensorInfo& info,
+                              const uint8_t* bytes) const {
+        Tensor<float> out = Safetensors::widenFrom(info, bytes);
+        if (info.dtype != "F8_E4M3" || info.shape.size() != 2) return out;
+
+        const auto found = blockScales.find(name);
+        if (found == blockScales.end() || found->second.shape.size() != 2) return out;
+
+        const Tensor<float>& sc = found->second;
+        const size_t rows = info.shape[0], cols = info.shape[1];
+        const size_t tileOut = (rows + sc.shape[0] - 1) / sc.shape[0];
+        const size_t tileIn  = (cols + sc.shape[1] - 1) / sc.shape[1];
+
+        for (size_t r = 0; r < rows; ++r) {
+            const float* srow = sc.ptr + (r / tileOut) * sc.shape[1];
+            float* row = out.ptr + r * cols;
+            for (size_t c = 0; c < cols; ++c) row[c] *= srow[c / tileIn];
+        }
+        return out;
+    }
+
+
+    /*
+        loadBlockScales(directory, files):
+        - every <weight>_scale_inv in the checkpoint, read ahead of the main
+          pass. Costs one extra header read per shard, and nothing more at
+          all when the checkpoint has no FP8 in it
+    */
+    bool loadBlockScales(const fs::path& directory, const std::vector<std::string>& files) {
+        static const std::string SUFFIX = "_scale_inv";
+
+        for (const std::string& file : files) {
+            Safetensors header;
+            if (!header.loadHeader(directory / file)) {
+                error = file + ": " + header.error;
+                return false;
+            }
+
+            ShardReader reader;
+            bool opened = false;
+
+            for (const auto& e : header.entries) {
+                if (!endsWith(e.first, SUFFIX) || skipped(e.first)) continue;
+
+                if (!opened) {
+                    if (!reader.open(directory / file, header.payloadBegin)) {
+                        error = file + ": " + reader.error;
+                        return false;
+                    }
+                    opened = true;
+                }
+
+                const uint8_t* bytes = reader.read(e.second);
+                if (!bytes) { error = e.first + ": " + reader.error; return false; }
+
+                blockScales[e.first.substr(0, e.first.size() - SUFFIX.size())] =
+                    Safetensors::widenFrom(e.second, bytes);
+            }
+        }
+        return true;
+    }
+
     const TensorInfo* info(const std::string& name) const {
         const Slot* s = slot(name);
         return s ? shards[s->shard].info(name) : nullptr;
@@ -992,6 +1155,7 @@ struct ModelWeights {
         size_t total = 0;
         for (const auto& t : quantized) total += t.second.byteCount();
         for (const auto& t : raw)       total += t.second.numel() * sizeof(uint16_t);
+        for (const auto& t : fp8)       total += t.second.numel();
         for (const auto& t : tensors)   total += t.second.numel() * sizeof(float);
 
         if (total) return total;
@@ -1122,8 +1286,13 @@ struct ModelWeights {
                     The bfloat16 path has no transient at all: the file bytes
                     ARE the weights, aliased rather than converted
                 */
-                if (streaming)
-                    out.largestTensor = std::max(out.largestTensor, e.second.byteCount());
+                if (streaming) {
+                    /* FP8 is widened to float before it is quantised, so
+                       while it is in flight it costs that copy as well */
+                    const size_t inFlight = e.second.byteCount()
+                        + (e.second.dtype == "F8_E4M3" ? e.second.numel() * sizeof(float) : 0);
+                    out.largestTensor = std::max(out.largestTensor, inFlight);
+                }
 
                 out.largestSynthetic = std::max(out.largestSynthetic,
                                                 e.second.numel() * sizeof(float));
