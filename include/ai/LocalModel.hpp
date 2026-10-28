@@ -978,6 +978,36 @@ inline void apply(const float* x, const Weight& W, float* out, size_t rows,
         return;
     }
 
+    /* a prompt: enough rows of x to be worth the register-tiled kernel,
+       which takes every weight format through one decode-a-block step */
+    if (rows >= kernels::TILE_MIN_ROWS) {
+        const size_t K = W.inDim;
+        if (W.isQuant())
+            kernels::matmulTiled(x, out, rows, K, W.outDim, [&](size_t j, size_t from, size_t n, float* to) {
+                quant::dequantRange(W.q, j, from, n, to);
+            }, threaded);
+        else if (W.isFP8())
+            kernels::matmulTiled(x, out, rows, K, W.outDim, [&](size_t j, size_t from, size_t n, float* to) {
+                W.f8.dequantRange(j, from, n, to);
+            }, threaded);
+        else if (W.isBF16())
+            kernels::matmulTiled(x, out, rows, K, W.outDim, [&](size_t j, size_t from, size_t n, float* to) {
+                const uint16_t* src = W.bf16.ptr + j * K + from;
+                for (size_t i = 0; i < n; ++i)
+                    to[i] = std::bit_cast<float>(static_cast<uint32_t>(src[i]) << 16);
+            }, threaded);
+        else
+            kernels::matmulTiled(x, out, rows, K, W.outDim, [&](size_t j, size_t from, size_t n, float* to) {
+                std::copy(W.f32.ptr + j * K + from, W.f32.ptr + j * K + from + n, to);
+            }, threaded);
+
+        if (W.hasBias())
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t j = 0; j < W.outDim; ++j)
+                    out[r * W.outDim + j] += W.bias.ptr[j];
+        return;
+    }
+
     if (W.isQuant())
         kernels::matmulNTQuant(x, W.q, out, rows, W.inDim, W.outDim, threaded);
     else if (W.isFP8())
@@ -3173,12 +3203,130 @@ struct LocalModel {
           what makes it behave like a 3B one: the parameters sit on the bus,
           and only the ones a token actually asked for are ever read.
     */
+    /*
+        rowDot(W, row, x):
+        - one output of x @ W^T, whatever form W is held in. The fused expert
+          path below works a row range at a time across several matrices,
+          which none of the whole-matrix kernels can be asked to do
+    */
+    static float rowDot(const Weight& W, size_t row, const float* x,
+                        const quant::ActivationView* xq = nullptr) {
+        const size_t K = W.inDim;
+        float v;
+        if (W.isFP8()) {
+            v = W.f8.dotRow(x, row);
+        } else if (W.isQuant() && xq) {
+            v = quant::dotQuantRow(*xq, W.q, row);
+        } else if (W.isQuant()) {
+            const size_t blocks = K / quant::BLOCK;
+            const bool   q4     = W.q.type == quant::Type::Q4;
+            const int8_t* q     = W.q.quants.get() + row * (q4 ? K / 2 : K);
+            const float*  s     = W.q.scales.get() + row * blocks;
+            v = q4 ? quant::dotQ4(x, q, s, K) : quant::dotQ8(x, q, s, K);
+        } else if (W.isBF16()) {
+            v = kernels::dotBF16(x, W.bf16.ptr + row * K, K);
+        } else {
+            v = kernels::dot(x, W.f32.ptr + row * K, K);
+        }
+        return W.hasBias() ? v + W.bias.ptr[row] : v;
+    }
+
+    /*
+        decodeExperts(h, L, chosen, share, out):
+        - one token's feed forward across EVERY thread. Handing each thread a
+          whole expert, as this used to, kept exactly as many threads busy as
+          experts were chosen - eight of them on GLM-5.3, whatever the
+          machine - while the rest of a large server waited.
+        - instead each thread takes the same slice of rows of every expert
+          the token chose, shared expert included: first gate and up, then
+          down. Its slice of down's rows is also its slice of the OUTPUT, so
+          it can sum every expert's contribution for those rows by itself,
+          with nothing to reduce afterwards. Two dispatches per layer.
+        - the slices are the ones the ordinary matmul gives each thread, so a
+          thread reads the rows the loader placed in its own NUMA node
+    */
+    void decodeExperts(const float* h, const LocalLayer& L, const std::vector<size_t>& chosen,
+                       const std::vector<float>& share, float* out) const {
+        const size_t H = cfg.hidden;
+
+        struct Part { const Expert* expert; float weight; size_t width, offset; };
+        std::vector<Part> parts;
+        size_t total = 0;
+
+        const auto add = [&](const Expert& e, float weight) {
+            parts.push_back({&e, weight, e.gate.outDim, total});
+            total += e.gate.outDim;
+        };
+        for (size_t j = 0; j < chosen.size(); ++j) add(L.experts[chosen[j]], share[j]);
+
+        if (L.shared.gate.valid()) {
+            float gate = 1.0f;
+            if (L.sharedScale.valid()) {
+                apply(h, L.sharedScale, &gate, 1, false);
+                gate = sigmoidOf(gate);
+            }
+            add(L.shared, gate);
+        }
+
+        std::vector<float> act(total);
+        kernels::Pool& pool = kernels::Pool::instance();
+        const size_t threads = pool.size();
+
+        /* Q8 / Q4 experts take their inputs in int8, quantised once here
+           rather than once per row by every thread */
+        bool integer = H % quant::BLOCK == 0;
+        for (const Part& p : parts)
+            integer = integer && p.expert->gate.isQuant() && p.expert->down.isQuant()
+                              && p.width % quant::BLOCK == 0;
+
+        quant::Activations hq, actq;
+        if (integer) hq.quantize(h, 1, H);
+        const quant::ActivationView hv = integer ? hq.row(0) : quant::ActivationView{};
+
+        pool.run(threads, [&](size_t begin, size_t end) {
+            for (size_t k = begin; k < end; ++k)
+                for (const Part& p : parts) {
+                    const auto [r0, r1] = kernels::Pool::slice(p.width, k, threads);
+                    for (size_t r = r0; r < r1; ++r)
+                        act[p.offset + r] = swiglu(rowDot(p.expert->gate, r, h, integer ? &hv : nullptr),
+                                                   rowDot(p.expert->up,   r, h, integer ? &hv : nullptr));
+                }
+        });
+
+        if (integer) actq.quantize(act.data(), 1, total);
+
+        pool.run(threads, [&](size_t begin, size_t end) {
+            for (size_t k = begin; k < end; ++k) {
+                const auto [r0, r1] = kernels::Pool::slice(H, k, threads);
+                for (size_t r = r0; r < r1; ++r) {
+                    float sum = 0.0f;
+                    for (const Part& p : parts) {
+                        /* each part's slice of the int8 copy starts on a
+                           block boundary, since every width is whole blocks */
+                        const quant::ActivationView pv = integer
+                            ? quant::ActivationView{actq.q.data() + p.offset,
+                                                    actq.s.data() + p.offset / quant::BLOCK}
+                            : quant::ActivationView{};
+                        sum += p.weight * rowDot(p.expert->down, r, &act[p.offset],
+                                                 integer ? &pv : nullptr);
+                    }
+                    out[r] = sum;
+                }
+            }
+        });
+    }
+
+
     void moeBlock(const float* h, const LocalLayer& L, size_t count,
                   float* out, const std::string& tag, LocalTrace* trace) const {
         const size_t H = cfg.hidden;
         const size_t E = cfg.numExperts;
         const size_t K = cfg.expertsPerToken;
         const size_t M = cfg.moeIntermediate;
+
+        /* one token on the CPU takes the fused path at the bottom, which
+           runs the shared expert along with the routed ones */
+        const bool fused = count == 1 && !L.experts.empty() && !L.experts[0].gate.onDevice();
 
         /*
             ---- the shared expert, which every token pays for ----------------
@@ -3187,7 +3335,9 @@ struct LocalModel {
             it first it has to be zeroed here, or the sum starts from whatever
             the buffer held last. GLM's is added in as it is, with no gate
         */
-        if (L.shared.gate.valid()) {
+        if (fused) {
+            // written in full below
+        } else if (L.shared.gate.valid()) {
             const size_t S = L.shared.gate.outDim;
             std::vector<float> sg(count * S), su(count * S), scale(count);
 
@@ -3335,31 +3485,8 @@ struct LocalModel {
             }
         };
 
-        const size_t lanes = std::min(active.size(), kernels::Pool::instance().size());
-
-        if (count == 1 && lanes > 1) {
-            /*
-                Decoding: the experts themselves are the parallel axis rather
-                than the rows inside each of their matmuls. Ten half-megabyte
-                experts is not enough work to pay for thirty pool wake-ups per
-                layer, and a thread that streams one whole expert reads it
-                contiguously - which at batch one, where this is all memory
-                traffic and barely any arithmetic, is the entire game.
-
-                Each lane accumulates into its own row and the rows are summed
-                after, since two experts the same token chose would otherwise
-                write the same elements at once.
-            */
-            std::vector<std::vector<float>> partial(lanes, std::vector<float>(H, 0.0f));
-            std::atomic<size_t> claim{0};
-
-            kernels::Pool::instance().run(active.size(), [&](size_t begin, size_t end) {
-                float* into = partial[claim.fetch_add(1, std::memory_order_relaxed)].data();
-                for (size_t i = begin; i < end; ++i) runExpert(i, into, false);
-            });
-
-            for (const std::vector<float>& part : partial)
-                for (size_t i = 0; i < H; ++i) out[i] += part[i];
+        if (fused) {
+            decodeExperts(h, L, chosen, share, out);
         } else {
             /* Prefilling: every expert has many rows to do, so there is
                ample work inside each matmul and one accumulator will do */

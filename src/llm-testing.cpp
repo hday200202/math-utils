@@ -206,6 +206,191 @@ static void testFp8() {
     const ai::quant::Fp8Tensor bare = ai::quant::makeFp8(codes, 4, 4, nullptr, 0, 0);
     bare.dequantRow(0, row);
     check("FP8 without a scale tensor is unscaled", row[0] == 1.0f && row[3] == 1.0f);
+
+    check("the arithmetic decode agrees with the table on every non-NaN code", [&] {
+        for (int c = 0; c < 256; ++c) {
+            if (std::isnan(t[c])) continue;
+            if (ai::quant::fp8Decode(static_cast<uint8_t>(c)) != t[c]) return false;
+        }
+        return true;
+    }());
+}
+
+
+/* ========================================================================= //
+    The pool's static split, and the kernels that lean on it
+// ========================================================================= */
+
+static void testPoolAndRows() {
+    section("pool and row kernels");
+
+    /* the loader places a matrix's rows next to the thread that will
+       multiply them, which only holds if a slice always goes to the same
+       thread */
+    ai::kernels::Pool& pool = ai::kernels::Pool::instance();
+    std::vector<std::thread::id> first(pool.size()), second(pool.size());
+    pool.run(pool.size(), [&](size_t b, size_t e) { for (size_t k = b; k < e; ++k) first[k]  = std::this_thread::get_id(); });
+    pool.run(pool.size(), [&](size_t b, size_t e) { for (size_t k = b; k < e; ++k) second[k] = std::this_thread::get_id(); });
+    check("the same slice runs on the same thread every time", first == second);
+
+    check("slices cover the range exactly once", [] {
+        for (size_t n : {0, 1, 7, 512, 1000, 4097}) {
+            size_t next = 0;
+            for (size_t k = 0; k < 24; ++k) {
+                const auto [a, z] = ai::kernels::Pool::slice(n, k, 24);
+                if (a != std::min(next, n) || z < a) return false;
+                next = std::max(next, z);
+            }
+            if (next != n) return false;
+        }
+        return true;
+    }());
+
+    /* rowDot against the whole-matrix kernel, for every form a weight takes */
+    const size_t N = 40, K = 256;
+    math::random::Random rng(7);
+    std::vector<float> w(N * K), x(K);
+    for (float& v : w) v = static_cast<float>(rng.normal(0.0, 0.5));
+    for (float& v : x) v = static_cast<float>(rng.normal(0.0, 1.0));
+
+    std::vector<uint16_t> bf(N * K);
+    for (size_t i = 0; i < N * K; ++i) bf[i] = static_cast<uint16_t>(std::bit_cast<uint32_t>(w[i]) >> 16);
+
+    std::shared_ptr<uint8_t[]> codes(new uint8_t[N * K]);
+    for (size_t i = 0; i < N * K; ++i) codes[i] = static_cast<uint8_t>(rng.randDouble(0.0, 1.0) * 255) & 0xF7;
+    std::shared_ptr<float[]> scales(new float[2 * 4]{1, 2, 3, 4, 0.5f, 0.25f, 2, 8});
+
+    std::vector<ai::Weight> forms(5);
+    forms[0].f32 = ai::Tensor<float>({N, K});
+    std::copy(w.begin(), w.end(), forms[0].f32.ptr);
+    forms[1].bf16 = ai::Tensor<uint16_t>({N, K});
+    std::copy(bf.begin(), bf.end(), forms[1].bf16.ptr);
+    forms[2].q = ai::quant::quantize(bf.data(), N, K, ai::quant::Type::Q8);
+    forms[3].q = ai::quant::quantize(bf.data(), N, K, ai::quant::Type::Q4);
+    forms[4].f8 = ai::quant::makeFp8(codes, N, K, scales, 2, 4);
+    const char* names[] = {"f32", "bf16", "q8", "q4", "fp8"};
+
+    /* quantised weights multiply int8 activations when one row comes
+       through, so rowDot is handed the same int8 copy the matmul makes */
+    ai::quant::Activations xq;
+    xq.quantize(x.data(), 1, K);
+    const ai::quant::ActivationView xv = xq.row(0);
+
+    /* what each row SHOULD come to, in double, from the stored weights */
+    const auto exact = [&](size_t f, size_t r) {
+        std::vector<float> row(K);
+        ai::LocalModel::widenRow(forms[f], r, row.data(), K);
+        double s = 0.0;
+        for (size_t k = 0; k < K; ++k) s += double(row[k]) * double(x[k]);
+        return s;
+    };
+
+    for (size_t f = 0; f < forms.size(); ++f) {
+        forms[f].outDim = N;
+        forms[f].inDim = K;
+        const bool quantised = forms[f].isQuant();
+        std::vector<float> whole(N);
+        ai::apply(x.data(), forms[f], whole.data(), 1);
+
+        /* the drift is measured against the size of the whole output: a row
+           that happens to sum to nearly zero would make any relative error
+           look enormous */
+        float worst = 0.0f;
+        double error = 0.0, size = 0.0;
+        for (size_t r = 0; r < N; ++r) {
+            const float one = ai::LocalModel::rowDot(forms[f], r, x.data(), quantised ? &xv : nullptr);
+            worst = std::max(worst, std::fabs(one - whole[r]) / (std::fabs(whole[r]) + 1e-3f));
+            error = std::max(error, std::fabs(whole[r] - exact(f, r)));
+            size  = std::max(size, std::fabs(exact(f, r)));
+        }
+        const float drift = float(error / size);
+        check(std::string("rowDot matches the matmul for ") + names[f], worst < 1e-4f);
+        /* int8 activations cost a little; float ones essentially nothing */
+        check(std::string("the ") + names[f] + " matmul is within "
+              + (quantised ? "2%" : "0.01%") + " of the exact product",
+              drift < (quantised ? 2e-2f : 1e-4f));
+    }
+
+    /* the tiled kernel a prompt takes, against one row at a time, with a row
+       count that leaves ragged tiles at both edges */
+    const size_t M = 13;
+    std::vector<float> xm(M * K);
+    for (float& v : xm) v = static_cast<float>(rng.normal(0.0, 1.0));
+    for (size_t f = 0; f < forms.size(); ++f) {
+        std::vector<float> tiled(M * N), single(N);
+        ai::apply(xm.data(), forms[f], tiled.data(), M);
+
+        float worst = 0.0f;
+        for (size_t i = 0; i < M; ++i) {
+            std::vector<float> row(K);
+            for (size_t r = 0; r < N; ++r) {
+                ai::LocalModel::widenRow(forms[f], r, row.data(), K);
+                double s = 0.0;
+                for (size_t k = 0; k < K; ++k) s += double(row[k]) * double(xm[i * K + k]);
+                worst = std::max(worst, float(std::fabs(tiled[i * N + r] - s) / (std::fabs(s) + 1.0)));
+            }
+        }
+        check(std::string("the tiled matmul is exact for ") + names[f], worst < 1e-4f);
+    }
+
+    /* the FP8 matmul's two paths, one row fused and many rows decoded once */
+    std::vector<float> xs(3 * K);
+    for (float& v : xs) v = static_cast<float>(rng.normal(0.0, 1.0));
+    std::vector<float> many(3 * N), one(N);
+    ai::kernels::matmulNTFP8(xs.data(), forms[4].f8, many.data(), 3, K, N, false);
+    float worst = 0.0f;
+    for (size_t i = 0; i < 3; ++i) {
+        ai::kernels::matmulNTFP8(xs.data() + i * K, forms[4].f8, one.data(), 1, K, N, false);
+        for (size_t j = 0; j < N; ++j)
+            worst = std::max(worst, std::fabs(one[j] - many[i * N + j]) / (std::fabs(many[i * N + j]) + 1e-3f));
+    }
+    check("the fused FP8 path agrees with the decode-once path", worst < 1e-4f);
+
+    /*
+        The parallel loader: a matrix tall enough to be split by rows across
+        the threads, a vector, and a tensor to skip, read through a window
+        small and odd enough that its edges fall mid-row and mid-tensor.
+        Every byte has to land where a plain read would have put it.
+    */
+    const fs::path file = fs::temp_directory_path() / "llm-testing-load.safetensors";
+    {
+        const size_t rows = 1000, cols = 37;
+        std::vector<float> big(rows * cols), small(29), dropped(50);
+        for (size_t i = 0; i < big.size(); ++i) big[i] = float(i) * 0.5f;
+        for (size_t i = 0; i < small.size(); ++i) small[i] = -float(i);
+        const size_t a = big.size() * 4, b = a + small.size() * 4, c = b + dropped.size() * 4;
+
+        std::string header = "{\"big\":{\"dtype\":\"F32\",\"shape\":[1000,37],\"data_offsets\":[0,"
+            + std::to_string(a) + "]},\"small\":{\"dtype\":\"F32\",\"shape\":[29],\"data_offsets\":["
+            + std::to_string(a) + "," + std::to_string(b) + "]},\"skip.me\":{\"dtype\":\"F32\","
+            "\"shape\":[50],\"data_offsets\":[" + std::to_string(b) + "," + std::to_string(c) + "]}}";
+        const uint64_t length = header.size();
+
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(&length), 8);
+        out << header;
+        out.write(reinterpret_cast<const char*>(big.data()), static_cast<std::streamsize>(a));
+        out.write(reinterpret_cast<const char*>(small.data()), static_cast<std::streamsize>(b - a));
+        out.write(reinterpret_cast<const char*>(dropped.data()), static_cast<std::streamsize>(c - b));
+    }
+
+    const size_t saved = ai::Safetensors::readWindow;
+    ai::Safetensors::readWindow = 1001;
+    ai::Safetensors st;
+    const bool loaded = st.load(file, {}, 0, 0,
+                                [](const std::string& n) { return n.rfind("skip.", 0) == 0; });
+    ai::Safetensors::readWindow = saved;
+
+    check("the windowed loader reads the file (" + st.error + ")", loaded);
+    if (loaded) {
+        const ai::Tensor<float> big = st.tensor("big"), small = st.tensor("small");
+        bool same = true;
+        for (size_t i = 0; i < 1000 * 37; ++i) same = same && big.ptr[i] == float(i) * 0.5f;
+        for (size_t i = 0; i < 29; ++i) same = same && small.ptr[i] == -float(i);
+        check("every row lands where it belongs across window edges", same);
+    }
+    std::error_code ec;
+    fs::remove(file, ec);
 }
 
 
@@ -982,6 +1167,7 @@ int main(int argc, char** argv) {
     testRegistry();
     testCores();
     testFp8();
+    testPoolAndRows();
     testGPT2(gpt2Dir, gpt2Oracle);
     testQwen3(qwenDir, qwenOracle);
     testQwen3Next(argc > 5 ? argv[5] : "models/tiny-qwen3next",

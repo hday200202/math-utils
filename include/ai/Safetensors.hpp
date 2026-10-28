@@ -13,8 +13,15 @@
 
 #include "Quant.hpp"
 #include "Tensor.hpp"
+#include "ThreadPool.hpp"
 #include "../files/File.hpp"
 #include "../files/JSON.hpp"
+#include "../platform/Memory.hpp"
+
+#if !defined(_WIN32)
+    #include <fcntl.h>
+    #include <unistd.h>
+#endif
 
 /*
     Reader for the .safetensors weight format.
@@ -81,13 +88,105 @@ struct TensorInfo {
     Safetensors
 // ========================================================================= */
 
+/*
+    Bytes:
+    - a buffer that is allocated but NOT initialised. A std::string or a
+      vector zero-fills, which on a 320GB checkpoint is 320GB of writing
+      before any reading starts - and, worse, it is the zero-filling thread
+      that first touches every page, so the operating system puts every page
+      on that thread's NUMA node. Left untouched, each page lands wherever
+      the thread that first writes real data into it is running
+*/
+struct Bytes {
+    std::unique_ptr<char[]> bytes;
+    size_t                  length = 0;
+
+    explicit Bytes(size_t n) : bytes(new char[n]), length(n) {}
+
+    char*       data()       { return bytes.get(); }
+    const char* data() const { return bytes.get(); }
+    size_t      size() const { return length; }
+};
+
+
+/*
+    FileAt:
+    - reads at an offset, one per thread, so many threads can read the same
+      file at once. POSIX pread on Linux, which also lets the page cache be
+      told to drop what has been copied out of it; a stream elsewhere
+*/
+class FileAt {
+public:
+    explicit FileAt(const fs::path& path) {
+#if defined(_WIN32)
+        m_in.open(path, std::ios::binary);
+        m_ok = static_cast<bool>(m_in);
+#else
+        m_fd = ::open(path.c_str(), O_RDONLY);
+        m_ok = m_fd >= 0;
+#endif
+    }
+
+    ~FileAt() {
+#if !defined(_WIN32)
+        if (m_fd >= 0) ::close(m_fd);
+#endif
+    }
+
+    FileAt(const FileAt&) = delete;
+    FileAt& operator=(const FileAt&) = delete;
+
+    bool ok() const { return m_ok; }
+
+    /* in pieces of at most 16MB: one read of more than 2GB comes back having
+       moved nothing on some platforms, and sets no error to say so */
+    bool read(size_t offset, char* into, size_t length) {
+        constexpr size_t CHUNK = size_t(1) << 24;
+        size_t got = 0;
+        while (got < length) {
+            const size_t want = std::min(CHUNK, length - got);
+#if defined(_WIN32)
+            m_in.clear();
+            m_in.seekg(static_cast<std::streamoff>(offset + got), std::ios::beg);
+            m_in.read(into + got, static_cast<std::streamsize>(want));
+            const size_t moved = static_cast<size_t>(m_in.gcount());
+#else
+            const ssize_t n = ::pread(m_fd, into + got, want, static_cast<off_t>(offset + got));
+            const size_t moved = n > 0 ? static_cast<size_t>(n) : 0;
+#endif
+            if (moved == 0) return false;
+            got += moved;
+        }
+        return true;
+    }
+
+    /* tells the OS it may drop its cached copy of these bytes - they have
+       been copied into our own memory and the cache is now a duplicate */
+    void forget(size_t offset, size_t length) {
+#if !defined(_WIN32)
+        ::posix_fadvise(m_fd, static_cast<off_t>(offset), static_cast<off_t>(length),
+                        POSIX_FADV_DONTNEED);
+#else
+        (void)offset; (void)length;
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    std::ifstream m_in;
+#else
+    int           m_fd = -1;
+#endif
+    bool          m_ok = false;
+};
+
+
 struct Safetensors {
     /*
         the entire file, kept alive for as long as any tensor views into it.
-        A std::string rather than a vector<uint8_t> only because files::File
-        hands back a string and this avoids a second copy of half a gigabyte
+        Uninitialised until read: see Bytes
     */
-    std::shared_ptr<std::string>                 blob;
+    std::shared_ptr<Bytes>                       blob;
     size_t                                       payloadBegin = 0;
     std::vector<std::pair<std::string, TensorInfo>> entries;   // in file order
 
@@ -102,21 +201,41 @@ struct Safetensors {
     files::json::Value                           metadata;
     std::string                                  error;
 
+    /* how much of a file load() stages at once. 1GB keeps the reads large
+       and the staging buffer small next to the model; the tests shrink it
+       to put window boundaries through the middle of tensors */
+    static inline size_t                         readWindow = size_t(1) << 30;
 
+
+    /*
+        load(path, onProgress, baseDone, grandTotal, skip):
+        - the header, then every tensor's bytes into one buffer that the
+          tensors then alias. Tensors `skip` names are never read at all.
+        - read by every thread of the pool at once, and placed by them too.
+          A single reader with one request in flight leaves fast storage
+          mostly idle, and it is also the thread that first touches every
+          page - so on a multi-socket server it puts the whole model on its
+          own socket's memory, and every other socket then reads every
+          weight across the interconnect for as long as the model runs.
+        - so the file goes through in windows. All the threads read a window
+          together, in large contiguous pieces, into a staging buffer; then
+          each copies out exactly the rows of each matrix that it will be the
+          one to multiply - Pool::slice decides both - and its first write
+          puts those rows in its own node's memory
+        - when the checkpoint is more than half of RAM, Linux is told to
+          drop each window from its page cache once copied. Otherwise the
+          cache keeps a second copy of everything read and pushes the
+          machine into reclaiming, or swapping, part way through the load
+    */
     bool load(const fs::path& path, const LoadProgress& onProgress = {},
-              size_t baseDone = 0, size_t grandTotal = 0) {
-        error.clear();
-        entries.clear();
-        index.clear();
-        blob.reset();
-
-        files::File file;
-        if (!file.open(path, files::OpenMode::Read)) {
-            error = "could not open " + path.string();
-            return false;
-        }
+              size_t baseDone = 0, size_t grandTotal = 0,
+              const std::function<bool(const std::string&)>& skip = {}) {
+        if (!loadHeader(path)) return false;
 
         const std::string label = path.filename().string();
+        std::error_code ec;
+        const size_t fileBytes = static_cast<size_t>(fs::file_size(path, ec));
+        const size_t payload   = fileBytes - payloadBegin;
 
         /*
             bad_alloc rather than a crash. A model larger than memory fails
@@ -124,34 +243,126 @@ struct Safetensors {
             useful place to find out than std::terminate with no message
         */
         try {
-            blob = std::make_shared<std::string>(
-                file.text([&](size_t done, size_t total) {
-                    if (onProgress)
-                        onProgress(baseDone + done, grandTotal ? grandTotal : total, label);
-                }));
+            blob = std::make_shared<Bytes>(fileBytes);
         } catch (const std::bad_alloc&) {
-            error = label + ": out of memory reading "
-                  + std::to_string(file.size() / (1024 * 1024)) + " MB";
-            return false;
-        }
-        if (blob->size() < 8) {
-            error = "file is too small to hold a header length";
+            error = label + ": out of memory reading " + std::to_string(fileBytes >> 20) + " MB";
             return false;
         }
 
-        uint64_t headerLength = 0;
-        std::memcpy(&headerLength, blob->data(), 8);
+        kernels::Pool& pool = kernels::Pool::instance();
+        const size_t threads = pool.size();
 
-        if (headerLength == 0 || headerLength + 8 > blob->size()) {
-            error = "header length " + std::to_string(headerLength) + " is out of range";
+        /* ---- who owns which bytes ------------------------------------- */
+        struct Piece { size_t begin, end; };            // payload offsets
+        std::vector<std::vector<Piece>> owned(threads);
+        std::vector<Piece> needed;
+
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& [name, info] = entries[i];
+            const size_t bytes = info.byteCount();
+            if (bytes == 0 || (skip && skip(name))) continue;
+            needed.push_back({info.begin, info.end});
+
+            /* a matmul splits a matrix by output rows - Pool::slice over its
+               first dimension - and a matrix too small to be split runs on
+               the caller; anything else is spread round for the reading */
+            const size_t rows = info.shape.empty() ? 1 : info.shape[0];
+            if (info.shape.size() >= 2 && rows >= 512 && bytes % rows == 0) {
+                const size_t rowBytes = bytes / rows;
+                for (size_t k = 0; k < threads; ++k) {
+                    const auto [r0, r1] = kernels::Pool::slice(rows, k, threads);
+                    if (r0 < r1)
+                        owned[k].push_back({info.begin + r0 * rowBytes, info.begin + r1 * rowBytes});
+                }
+            } else {
+                owned[info.shape.size() >= 2 ? 0 : i % threads].push_back({info.begin, info.end});
+            }
+        }
+
+        const auto byBegin = [](const Piece& a, const Piece& b) { return a.begin < b.begin; };
+        for (auto& list : owned) std::sort(list.begin(), list.end(), byBegin);
+
+        /* the ranges worth reading at all, merged where they touch */
+        std::sort(needed.begin(), needed.end(), byBegin);
+        std::vector<Piece> merged;
+        for (const Piece& p : needed) {
+            if (!merged.empty() && p.begin <= merged.back().end)
+                merged.back().end = std::max(merged.back().end, p.end);
+            else
+                merged.push_back(p);
+        }
+
+        /* ---- through the file a window at a time ----------------------- */
+        const size_t window = std::min(readWindow, std::max<size_t>(payload, 1));
+
+        std::unique_ptr<char[]> staging;
+        try {
+            staging.reset(new char[window]);
+        } catch (const std::bad_alloc&) {
+            error = label + ": out of memory for the read buffer";
             return false;
         }
 
-        payloadBegin = 8 + static_cast<size_t>(headerLength);
+        const size_t total = platform::totalMemory();
+        const bool forget = total > 0 && (grandTotal ? grandTotal : fileBytes) > total / 2;
 
-        return parseEntries(std::string_view(blob->data() + 8,
-                                             static_cast<size_t>(headerLength)),
-                            blob->size() - payloadBegin);
+        std::vector<std::unique_ptr<FileAt>> readers(threads);
+        std::vector<size_t> cursor(threads, 0);
+        std::atomic<bool> failed{false};
+        char* const base = blob->data() + payloadBegin;
+
+        for (size_t w = 0; w < payload && !failed; w += window) {
+            const size_t wend = std::min(w + window, payload);
+
+            /* skip a window holding nothing anyone wants */
+            const auto first = std::lower_bound(merged.begin(), merged.end(), Piece{w, w},
+                [](const Piece& a, const Piece& b) { return a.end <= b.begin; });
+            if (first == merged.end() || first->begin >= wend) continue;
+
+            // 1. read: each thread a contiguous share, clipped to what is needed
+            pool.run(threads, [&](size_t begin, size_t end) {
+                for (size_t k = begin; k < end; ++k) {
+                    const auto [a, z] = kernels::Pool::slice(wend - w, k, threads);
+                    if (a >= z) continue;
+                    if (!readers[k]) readers[k] = std::make_unique<FileAt>(path);
+                    if (!readers[k]->ok()) { failed = true; continue; }
+
+                    for (auto m = first; m != merged.end() && m->begin < w + z; ++m) {
+                        const size_t from = std::max(m->begin, w + a);
+                        const size_t to   = std::min(m->end,   w + z);
+                        if (from < to && !readers[k]->read(payloadBegin + from,
+                                                           staging.get() + (from - w), to - from))
+                            failed = true;
+                    }
+                }
+            });
+
+            // 2. place: each thread copies the pieces it owns out of the window
+            pool.run(threads, [&](size_t begin, size_t end) {
+                for (size_t k = begin; k < end; ++k) {
+                    std::vector<Piece>& list = owned[k];
+                    size_t& at = cursor[k];
+                    while (at < list.size() && list[at].begin < wend) {
+                        const size_t from = std::max(list[at].begin, w);
+                        const size_t to   = std::min(list[at].end, wend);
+                        if (from < to) std::memcpy(base + from, staging.get() + (from - w), to - from);
+                        if (list[at].end > wend) break;     // continues in the next window
+                        ++at;
+                    }
+                }
+            });
+
+            if (forget && readers[0]) readers[0]->forget(payloadBegin + w, wend - w);
+            if (onProgress) onProgress(baseDone + payloadBegin + wend,
+                                       grandTotal ? grandTotal : fileBytes, label);
+        }
+
+        if (failed) {
+            error = label + ": could not read the tensor payload";
+            blob.reset();
+            return false;
+        }
+        return true;
     }
 
 
@@ -801,7 +1012,8 @@ struct ModelWeights {
 
             const bool opened = stream
                 ? shards[i].loadHeader(directory / files[i])
-                : shards[i].load(directory / files[i], onProgress, done, grandTotal);
+                : shards[i].load(directory / files[i], onProgress, done, grandTotal,
+                                 [this](const std::string& name) { return skipped(name); });
 
             if (!opened) {
                 error = files[i] + ": " + shards[i].error;
@@ -1068,22 +1280,26 @@ struct ModelWeights {
     */
     Tensor<float> widenScaled(const std::string& name, const TensorInfo& info,
                               const uint8_t* bytes) const {
-        Tensor<float> out = Safetensors::widenFrom(info, bytes);
-        if (info.dtype != "F8_E4M3" || info.shape.size() != 2) return out;
+        if (info.dtype != "F8_E4M3" || info.shape.size() != 2)
+            return Safetensors::widenFrom(info, bytes);
 
-        const auto found = blockScales.find(name);
-        if (found == blockScales.end() || found->second.shape.size() != 2) return out;
-
-        const Tensor<float>& sc = found->second;
+        /* decoded and scaled a row at a time across the pool: under --q8 or
+           --q4 every one of GLM-5.3's 314 billion FP8 weights comes through
+           here, which on one thread is most of the load */
         const size_t rows = info.shape[0], cols = info.shape[1];
-        const size_t tileOut = (rows + sc.shape[0] - 1) / sc.shape[0];
-        const size_t tileIn  = (cols + sc.shape[1] - 1) / sc.shape[1];
+        const auto found = blockScales.find(name);
+        const bool scaled = found != blockScales.end() && found->second.shape.size() == 2;
 
-        for (size_t r = 0; r < rows; ++r) {
-            const float* srow = sc.ptr + (r / tileOut) * sc.shape[1];
-            float* row = out.ptr + r * cols;
-            for (size_t c = 0; c < cols; ++c) row[c] *= srow[c / tileIn];
-        }
+        const quant::Fp8Tensor view = quant::makeFp8(
+            std::shared_ptr<uint8_t[]>(std::shared_ptr<uint8_t[]>(), const_cast<uint8_t*>(bytes)),
+            rows, cols,
+            scaled ? found->second.storage : nullptr,
+            scaled ? found->second.shape[0] : 0, scaled ? found->second.shape[1] : 0);
+
+        Tensor<float> out(info.shape);
+        kernels::Pool::instance().run(rows, [&](size_t begin, size_t end) {
+            for (size_t r = begin; r < end; ++r) view.dequantRow(r, out.ptr + r * cols);
+        });
         return out;
     }
 
@@ -1097,33 +1313,46 @@ struct ModelWeights {
     bool loadBlockScales(const fs::path& directory, const std::vector<std::string>& files) {
         static const std::string SUFFIX = "_scale_inv";
 
-        for (const std::string& file : files) {
-            Safetensors header;
-            if (!header.loadHeader(directory / file)) {
-                error = file + ": " + header.error;
-                return false;
-            }
+        /* a shard per thread: thousands of tiny reads each, which on a
+           network filesystem is latency rather than bandwidth, and latency
+           only overlaps if the shards are read at the same time */
+        std::vector<std::vector<std::pair<std::string, Tensor<float>>>> found(files.size());
+        std::vector<std::string> errors(files.size());
 
-            ShardReader reader;
-            bool opened = false;
-
-            for (const auto& e : header.entries) {
-                if (!endsWith(e.first, SUFFIX) || skipped(e.first)) continue;
-
-                if (!opened) {
-                    if (!reader.open(directory / file, header.payloadBegin)) {
-                        error = file + ": " + reader.error;
-                        return false;
-                    }
-                    opened = true;
+        kernels::Pool::instance().run(files.size(), [&](size_t begin, size_t end) {
+            for (size_t f = begin; f < end; ++f) {
+                Safetensors header;
+                if (!header.loadHeader(directory / files[f])) {
+                    errors[f] = files[f] + ": " + header.error;
+                    continue;
                 }
 
-                const uint8_t* bytes = reader.read(e.second);
-                if (!bytes) { error = e.first + ": " + reader.error; return false; }
+                ShardReader reader;
+                bool opened = false;
 
-                blockScales[e.first.substr(0, e.first.size() - SUFFIX.size())] =
-                    Safetensors::widenFrom(e.second, bytes);
+                for (const auto& e : header.entries) {
+                    if (!endsWith(e.first, SUFFIX) || skipped(e.first)) continue;
+
+                    if (!opened) {
+                        if (!reader.open(directory / files[f], header.payloadBegin)) {
+                            errors[f] = files[f] + ": " + reader.error;
+                            break;
+                        }
+                        opened = true;
+                    }
+
+                    const uint8_t* bytes = reader.read(e.second);
+                    if (!bytes) { errors[f] = e.first + ": " + reader.error; break; }
+
+                    found[f].emplace_back(e.first.substr(0, e.first.size() - SUFFIX.size()),
+                                          Safetensors::widenFrom(e.second, bytes));
+                }
             }
+        });
+
+        for (size_t f = 0; f < files.size(); ++f) {
+            if (!errors[f].empty()) { error = errors[f]; return false; }
+            for (auto& [name, scale] : found[f]) blockScales[name] = std::move(scale);
         }
         return true;
     }

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "ThreadPool.hpp"
@@ -145,22 +147,15 @@ inline void matmulNT(const float* A, const float* B, float* C,
 */
 inline void matmulNTQuant(const float* A, const quant::QuantTensor& W, float* C,
                           size_t M, size_t K, size_t N, bool threaded = true) {
-    const size_t blocks = K / quant::BLOCK;
-    const size_t rowQuants = (W.type == quant::Type::Q4) ? K / 2 : K;
-    const bool q4 = (W.type == quant::Type::Q4);
-
-    const int8_t* base = W.quants.get();
-    const float* allScales = W.scales.get();
+    /* the activations go to int8 once, here, and every weight row reuses
+       them - see quant::dotQ8Q8 */
+    quant::Activations act;
+    act.quantize(A, M, K);
 
     const auto body = [&](size_t begin, size_t end) {
-        for (size_t j = begin; j < end; ++j) {
-            const int8_t* qrow = base + j * rowQuants;
-            const float* srow = allScales + j * blocks;
-
+        for (size_t j = begin; j < end; ++j)
             for (size_t i = 0; i < M; ++i)
-                C[i * N + j] = q4 ? quant::dotQ4(A + i * K, qrow, srow, K)
-                                  : quant::dotQ8(A + i * K, qrow, srow, K);
-        }
+                C[i * N + j] = quant::dotQuantRow(act.row(i), W, j);
     };
 
     if (!threaded || N < 512) { body(0, N); return; }
@@ -195,16 +190,22 @@ inline void matmulNTBF16(const float* A, const uint16_t* B, float* C,
 
 /*
     matmulNTFP8(A, W, C, ...):
-    - the same against FP8 weights with a scale per tile. Each weight row is
-      decoded into a scratch row once - every code through the table, times
-      its tile's scale - and then dotted against every row of A, so a prompt
-      pays for the decode once per weight row rather than once per token.
-    - the scratch is per call of the body, so each thread has its own and
-      nothing is shared between them
+    - the same against FP8 weights with a scale per tile.
+    - generating a token (M = 1) decodes each code straight into the dot
+      product: nothing is written, and the one pass over the codes is the
+      only memory traffic
+    - a prompt (M > 1) decodes each weight row into scratch once and dots it
+      against every row of A, so the decode is paid once per weight row
+      rather than once per token. The scratch is per call of the body, so
+      each thread has its own
 */
 inline void matmulNTFP8(const float* A, const quant::Fp8Tensor& W, float* C,
                         size_t M, size_t K, size_t N, bool threaded = true) {
     const auto body = [&](size_t begin, size_t end) {
+        if (M == 1) {
+            for (size_t j = begin; j < end; ++j) C[j] = W.dotRow(A, j);
+            return;
+        }
         std::vector<float> row(K);
         for (size_t j = begin; j < end; ++j) {
             W.dequantRow(j, row.data());
@@ -216,6 +217,147 @@ inline void matmulNTFP8(const float* A, const quant::Fp8Tensor& W, float* C,
     if (!threaded || N < 512) { body(0, N); return; }
 
     Pool::instance().run(N, body);
+}
+
+
+/* ========================================================================= //
+    Tiled matmul, for prompts
+
+    The kernels above compute each output as one dot product: a row of A
+    against a row of B, two loads for every multiply-add. That is the right
+    shape for generating a token, where A is one row and the whole job is
+    streaming B out of memory once. It is the wrong shape for a prompt of a
+    few hundred tokens, where the work is arithmetic and two loads per FMA
+    caps it at half of what the core can do - and where A, being too big for
+    cache, is fetched again for every row of B.
+
+    So a prompt goes through a register tile instead: MR rows of A against
+    NR rows of B at once, MR + NR vector loads feeding MR * NR FMAs. Around
+    that, B is taken a block of NB rows by KB columns at a time, decoded to
+    float once into a scratch that stays in L2, and every row of A is run
+    past it before the next block - so a weight in any format is widened
+    once per block rather than once per token.
+
+    The vectors are GCC/Clang vector types rather than intrinsics: the
+    compiler picks the instructions for whatever -march says, and the same
+    source is AVX-512 on the server and AVX2 on a laptop.
+// ========================================================================= */
+
+#if defined(__AVX512F__)
+constexpr size_t VL = 16;
+constexpr size_t MR = 4, NR = 4;            // 16 accumulators of 32 zmm registers
+#elif defined(__AVX__)
+constexpr size_t VL = 8;
+constexpr size_t MR = 2, NR = 4;            // 8 accumulators of 16 ymm registers
+#else
+/* SSE only: a wider vector than the hardware has would be split anyway,
+   and passing one by value changes the ABI */
+constexpr size_t VL = 4;
+constexpr size_t MR = 2, NR = 4;
+#endif
+typedef float VFloat __attribute__((vector_size(VL * sizeof(float))));
+
+constexpr size_t NB = 64;                   // weight rows per block
+constexpr size_t KB = 512;                  // columns per block: a multiple of every
+                                            // quantisation block, 32 and 128
+
+/* below this many rows of A the plain kernels win: there is too little
+   reuse to pay for the decoding into scratch */
+constexpr size_t TILE_MIN_ROWS = 8;
+
+inline VFloat loadV(const float* p) {
+    VFloat v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+/*
+    tile<R, Q>(a, b, length, c, ldc):
+    - c[r * ldc + q] += a[r] . b[q] over `length` floats, for R rows of A
+      and Q rows of scratch. Full tiles are MR x NR; the ragged edge of a
+      block uses smaller instantiations of the same code
+*/
+template <size_t R, size_t Q>
+inline void tile(const float* const* a, const float* const* b, size_t length, float* c, size_t ldc) {
+    VFloat acc[R][Q] = {};
+    size_t k = 0;
+    for (; k + VL <= length; k += VL) {
+        VFloat bv[Q];
+        for (size_t q = 0; q < Q; ++q) bv[q] = loadV(b[q] + k);
+        for (size_t r = 0; r < R; ++r) {
+            const VFloat av = loadV(a[r] + k);
+            for (size_t q = 0; q < Q; ++q) acc[r][q] += av * bv[q];
+        }
+    }
+
+    for (size_t r = 0; r < R; ++r)
+        for (size_t q = 0; q < Q; ++q) {
+            float s = 0.0f;
+            for (size_t l = 0; l < VL; ++l) s += acc[r][q][l];
+            for (size_t t = k; t < length; ++t) s += a[r][t] * b[q][t];
+            c[r * ldc + q] += s;
+        }
+}
+
+/*
+    matmulTiled(A, C, M, K, N, decode, threaded):
+    - C[M,N] = A[M,K] @ B^T for a B that is only ever seen through
+      decode(row, from, length, out), which writes columns [from, from +
+      length) of B's row as floats. Every weight format supplies one.
+    - split across threads by weight rows, the same static slices as every
+      other kernel, so each thread works on the rows the loader placed near
+      it. A matrix too narrow to split that way - a router, a gate - is
+      split by rows of A instead, since a long prompt through one thread is
+      the thing being fixed here
+*/
+template <typename Decode>
+inline void matmulTiled(const float* A, float* C, size_t M, size_t K, size_t N,
+                        const Decode& decode, bool threaded = true) {
+    const auto run = [&](size_t j0, size_t j1, size_t i0, size_t i1) {
+        std::vector<float> scratch(NB * KB);
+
+        for (size_t jb = j0; jb < j1; jb += NB) {
+            const size_t nb = std::min(NB, j1 - jb);
+            for (size_t i = i0; i < i1; ++i) std::fill(C + i * N + jb, C + i * N + jb + nb, 0.0f);
+
+            for (size_t kb = 0; kb < K; kb += KB) {
+                const size_t kl = std::min(KB, K - kb);
+                for (size_t jj = 0; jj < nb; ++jj) decode(jb + jj, kb, kl, &scratch[jj * kl]);
+
+                const float* a[MR];
+                const float* b[NR];
+                size_t i = i0;
+                for (; i + MR <= i1; i += MR) {
+                    for (size_t r = 0; r < MR; ++r) a[r] = A + (i + r) * K + kb;
+                    size_t jj = 0;
+                    for (; jj + NR <= nb; jj += NR) {
+                        for (size_t q = 0; q < NR; ++q) b[q] = &scratch[(jj + q) * kl];
+                        tile<MR, NR>(a, b, kl, C + i * N + jb + jj, N);
+                    }
+                    for (; jj < nb; ++jj) {
+                        b[0] = &scratch[jj * kl];
+                        tile<MR, 1>(a, b, kl, C + i * N + jb + jj, N);
+                    }
+                }
+                for (; i < i1; ++i) {
+                    a[0] = A + i * K + kb;
+                    size_t jj = 0;
+                    for (; jj + NR <= nb; jj += NR) {
+                        for (size_t q = 0; q < NR; ++q) b[q] = &scratch[(jj + q) * kl];
+                        tile<1, NR>(a, b, kl, C + i * N + jb + jj, N);
+                    }
+                    for (; jj < nb; ++jj) {
+                        b[0] = &scratch[jj * kl];
+                        tile<1, 1>(a, b, kl, C + i * N + jb + jj, N);
+                    }
+                }
+            }
+        }
+    };
+
+    if (!threaded) { run(0, N, 0, M); return; }
+    if (N >= 512)  { Pool::instance().run(N, [&](size_t b, size_t e) { run(b, e, 0, M); }); return; }
+    Pool::instance().run(M, [&](size_t b, size_t e) { run(0, N, b, e); });
 }
 
 
