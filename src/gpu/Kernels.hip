@@ -633,6 +633,13 @@ AI_GPU_ABI void aigpu_reset_counters(void) {
     Context::instance().stats = AiGpuCounters{};
 }
 
+AI_GPU_ABI int aigpu_dense_supported(void) { return 0; }
+AI_GPU_ABI void* aigpu_dense_create(const AiGpuDenseConfig*, const AiGpuDenseLayer*,
+    const float* const*, const float* const*, uint32_t) { return nullptr; }
+AI_GPU_ABI void aigpu_dense_release(void*) {}
+AI_GPU_ABI void aigpu_dense_decode(void*, const float*, float*, uint32_t) {}
+AI_GPU_ABI void aigpu_dense_read_cache(void*, float* const*, float* const*, uint32_t) {}
+
 } // !extern "C"
 
 } // !namespace gpu

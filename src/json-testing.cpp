@@ -430,7 +430,8 @@ static void testSafetensorsHeader() {
 
 
 int main(int argc, char** argv) {
-    if (argc > 1) modelDir = argv[1];
+    const bool unitOnly = argc == 2 && std::string(argv[1]) == "--unit";
+    if (argc > 1 && !unitOnly) modelDir = argv[1];
 
     testPrimitives();
     testEscapes();
@@ -438,8 +439,12 @@ int main(int argc, char** argv) {
     testMissing();
     testErrors();
     testRoundTrip();
-    testConfigFile();
-    testSafetensorsHeader();
+    if (!unitOnly) {
+        testConfigFile();
+        testSafetensorsHeader();
+    } else {
+        std::cout << "\nUnit mode: GPT-2 checkpoint integration tests were not run.\n";
+    }
 
     std::cout << "\n"
               << (failures ? COLOR_RED : COLOR_GREEN)

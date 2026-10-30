@@ -11,8 +11,15 @@
 #include <string>
 #include <vector>
 
+#ifndef AI_QUANT_AVX512
+#define AI_QUANT_AVX512 1
+#endif
+
 #if defined(__AVX2__)
     #include <immintrin.h>
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    #include <arm_neon.h>
 #endif
 
 #include "ThreadPool.hpp"
@@ -284,6 +291,32 @@ inline Fp8Tensor makeFp8(std::shared_ptr<uint8_t[]> codes, size_t outDim, size_t
       so the stored range 0..15 covers -8..7. See the Q4 branch for why the
       scale and the pairing are both chosen the way they are
 */
+#if defined(__AVX2__)
+// lround uses ties away from zero. Adding 0.5 before truncation is not
+// equivalent near half-way values, so compare the exact fractional part.
+inline __m256i roundAwayAVX2(__m256 v) {
+    const __m256i whole = _mm256_cvttps_epi32(v);
+    const __m256 fraction = _mm256_andnot_ps(_mm256_set1_ps(-0.0f),
+        _mm256_sub_ps(v, _mm256_cvtepi32_ps(whole)));
+    const __m256i step = _mm256_and_si256(_mm256_castps_si256(
+        _mm256_cmp_ps(fraction, _mm256_set1_ps(0.5f), _CMP_GE_OQ)), _mm256_set1_epi32(1));
+    const __m256i sign = _mm256_srai_epi32(_mm256_castps_si256(v), 31);
+    return _mm256_add_epi32(whole, _mm256_sub_epi32(_mm256_xor_si256(step, sign), sign));
+}
+
+inline __m256i quantizeBlockAVX2(const float* in, float inv, int lower, int upper) {
+    __m256i q[4];
+    for (size_t i = 0; i < 4; ++i) {
+        const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(in + i * 8), _mm256_set1_ps(inv));
+        q[i] = _mm256_min_epi32(_mm256_max_epi32(roundAwayAVX2(v),
+            _mm256_set1_epi32(lower)), _mm256_set1_epi32(upper));
+    }
+    const __m256i packed = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]),
+                                             _mm256_packs_epi32(q[2], q[3]));
+    return _mm256_permutevar8x32_epi32(packed, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+}
+#endif
+
 template <typename Src>
 inline void quantizeRow(const Src* src, int8_t* out, float* scales,
                         size_t inDim, Type type) {
@@ -304,10 +337,16 @@ inline void quantizeRow(const Src* src, int8_t* out, float* scales,
             scales[b] = scale;
 
             int8_t* dst = out + b * BLOCK;
+#if defined(__AVX2__)
+            alignas(32) float values[BLOCK];
+            for (size_t j = 0; j < BLOCK; ++j) values[j] = widenSource(in[j]);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), quantizeBlockAVX2(values, inv, -127, 127));
+#else
             for (size_t j = 0; j < BLOCK; ++j) {
                 const int v = static_cast<int>(std::lround(widenSource(in[j]) * inv));
                 dst[j] = static_cast<int8_t>(std::clamp(v, -127, 127));
             }
+#endif
         } else {
             /*
                 The scale comes from the SIGNED extreme over -8, not from the
@@ -350,6 +389,13 @@ inline void quantizeRow(const Src* src, int8_t* out, float* scales,
             */
             constexpr size_t HALF = BLOCK / 2;
             int8_t* dst = out + b * HALF;
+#if defined(__AVX2__)
+            alignas(32) float values[BLOCK];
+            for (size_t j = 0; j < BLOCK; ++j) values[j] = widenSource(in[j]);
+            const __m256i codes = _mm256_add_epi8(quantizeBlockAVX2(values, inv, -8, 7), _mm256_set1_epi8(8));
+            const __m128i lo = _mm256_castsi256_si128(codes), hi = _mm256_extracti128_si256(codes, 1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_or_si128(lo, _mm_slli_epi16(hi, 4)));
+#else
             for (size_t j = 0; j < HALF; ++j) {
                 const int lo = std::clamp(
                     static_cast<int>(std::lround(widenSource(in[j]) * inv)) + 8, 0, 15);
@@ -357,6 +403,7 @@ inline void quantizeRow(const Src* src, int8_t* out, float* scales,
                     static_cast<int>(std::lround(widenSource(in[j + HALF]) * inv)) + 8, 0, 15);
                 dst[j] = static_cast<int8_t>((hi << 4) | lo);
             }
+#endif
         }
     }
 }
@@ -399,6 +446,27 @@ inline QuantTensor quantize(const Src* src, size_t outDim, size_t inDim, Type ty
     return out;
 }
 
+
+// Decode one FP8 row per worker, then quantize directly into final storage.
+// Full-tensor FP32 staging both quadrupled scratch and first-touched it on
+// the caller's NUMA node before the worker could place its own output rows.
+inline QuantTensor quantizeFp8(const Fp8Tensor& source, Type type) {
+    QuantTensor out;
+    if (!source.valid() || type == Type::None || source.inDim % BLOCK) return out;
+    out.type = type; out.outDim = source.outDim; out.inDim = source.inDim;
+    const size_t stride = type == Type::Q4 ? out.inDim / 2 : out.inDim;
+    out.quants = std::shared_ptr<int8_t[]>(new int8_t[out.outDim * stride]);
+    out.scales = std::shared_ptr<float[]>(new float[out.outDim * out.blocksPerRow()]);
+    kernels::Pool::instance().run(out.outDim, [&](size_t begin, size_t end) {
+        std::vector<float> row(out.inDim);
+        for (size_t r = begin; r < end; ++r) {
+            source.dequantRow(r, row.data());
+            quantizeRow(row.data(), out.quants.get() + r * stride,
+                out.scales.get() + r * out.blocksPerRow(), out.inDim, type);
+        }
+    });
+    return out;
+}
 
 /* ========================================================================= //
     Dot products
@@ -504,6 +572,8 @@ inline void dequantRow(const QuantTensor& t, size_t row, float* out) {
         AVX-512 VNNI / AVX-VNNI   vpdpbusd: 32 byte products summed into
                                   eight 32-bit lanes, one instruction
         AVX2                      vpmaddubsw then vpmaddwd: the same in two
+        ARM64 Neon                signed dot products (SDOT), or widening
+                                  multiplies when dotprod is not targeted
         anything else             a plain loop, as correct and slower
     vpdpbusd and vpmaddubsw multiply UNSIGNED bytes by signed ones, so the
     activation's sign is moved onto the weight first - |a| * (w * sign a) is
@@ -522,15 +592,36 @@ inline void dequantRow(const QuantTensor& t, size_t row, float* out) {
 inline void quantizeActivation(const float* x, size_t n, int8_t* q, float* scales) {
     for (size_t b = 0; b < n / BLOCK; ++b) {
         const float* in = x + b * BLOCK;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        float32x4_t maximum = vdupq_n_f32(0.0f);
+        for (size_t j = 0; j < BLOCK; j += 4)
+            maximum = vmaxq_f32(maximum, vabsq_f32(vld1q_f32(in + j)));
+        const float amax = vmaxvq_f32(maximum);
+#else
         float amax = 0.0f;
         for (size_t j = 0; j < BLOCK; ++j) amax = std::max(amax, std::fabs(in[j]));
+#endif
 
         const float scale = amax / 127.0f;
         const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
         scales[b] = scale;
+#if defined(__AVX2__)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + b * BLOCK), quantizeBlockAVX2(in, inv, -127, 127));
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+        for (size_t j = 0; j < BLOCK; j += 8) {
+            // FCVTAS matches lround: nearest, with half-way ties away from
+            // zero. Saturate to the same -127..127 range before narrowing.
+            const int32x4_t lo = vcvtaq_s32_f32(vmulq_n_f32(vld1q_f32(in + j), inv));
+            const int32x4_t hi = vcvtaq_s32_f32(vmulq_n_f32(vld1q_f32(in + j + 4), inv));
+            int8x8_t codes = vqmovn_s16(vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi)));
+            codes = vmax_s8(codes, vdup_n_s8(-127));
+            vst1_s8(q + b * BLOCK + j, codes);
+        }
+#else
         for (size_t j = 0; j < BLOCK; ++j)
             q[b * BLOCK + j] = static_cast<int8_t>(std::clamp(
                 static_cast<int>(std::lround(in[j] * inv)), -127, 127));
+#endif
     }
 }
 
@@ -582,6 +673,74 @@ inline float sumLanes(__m256 v) {
 }
 #endif
 
+#if AI_QUANT_AVX512 && defined(__AVX512F__) && defined(__AVX512BW__)
+inline __m512i dotBytes512(__m512i a, __m512i w) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i magnitude = _mm512_abs_epi8(a);
+    const __m512i signedW = _mm512_mask_sub_epi8(w, _mm512_cmpgt_epi8_mask(zero, a), zero, w);
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(zero, magnitude, signedW);
+#else
+    return _mm512_madd_epi16(_mm512_maddubs_epi16(magnitude, signedW), _mm512_set1_epi16(1));
+#endif
+}
+
+// Two scale blocks per ZMM, two independent accumulation chains. Unlike
+// globally enabling fast-math this changes only the dot-product reduction.
+inline float dotQuant512(ActivationView a, const int8_t* weights, const float* ws,
+                         size_t n, bool q4) {
+    const size_t blocks = n / BLOCK;
+    const auto pair = [&](size_t b) {
+        __m512i w;
+        if (q4) {
+            const __m256i p = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + b * 16));
+            const __m256i mask = _mm256_set1_epi8(15);
+            const __m256i lo = _mm256_and_si256(p, mask);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(p, 4), mask);
+            w = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+            w = _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 1, 4, 5, 2, 3, 6, 7), w);
+            w = _mm512_sub_epi8(w, _mm512_set1_epi8(8));
+        } else w = _mm512_loadu_si512(weights + b * BLOCK);
+        const __m512i av = _mm512_loadu_si512(a.q + b * BLOCK);
+        const __m512 scale = _mm512_mask_blend_ps(0xff00,
+            _mm512_set1_ps(a.s[b] * ws[b]), _mm512_set1_ps(a.s[b + 1] * ws[b + 1]));
+        return _mm512_mul_ps(_mm512_cvtepi32_ps(dotBytes512(av, w)), scale);
+    };
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    size_t b = 0;
+    for (; b + 3 < blocks; b += 4) {
+        a0 = _mm512_add_ps(a0, pair(b));
+        a1 = _mm512_add_ps(a1, pair(b + 2));
+    }
+    if (b + 1 < blocks) { a0 = _mm512_add_ps(a0, pair(b)); b += 2; }
+    float result = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+    if (b < blocks) {
+        int sum = 0;
+        for (size_t j = 0; j < BLOCK; ++j) {
+            const uint8_t packed = uint8_t(weights[b * 16 + j % 16]);
+            const int w = q4 ? int((packed >> (j < 16 ? 0 : 4)) & 15) - 8 : weights[b * BLOCK + j];
+            sum += int(a.q[b * BLOCK + j]) * w;
+        }
+        result += float(sum) * (a.s[b] * ws[b]);
+    }
+    return result;
+}
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// Four partial sums of 16 signed byte products. Keep the widening fallback
+// for ARM64 targets that do not enable the optional dot-product extension.
+inline int32x4_t dotBytesNEON(int32x4_t acc, int8x16_t a, int8x16_t w) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, a, w);
+#else
+    const int16x8_t lo = vmull_s8(vget_low_s8(a), vget_low_s8(w));
+    const int16x8_t hi = vmull_s8(vget_high_s8(a), vget_high_s8(w));
+    return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
+#endif
+}
+#endif
+
 /* the 32 weights of block b of a Q4 row, unpacked to -8..7 */
 inline void unpackQ4(const uint8_t* packed, int8_t* out) {
     constexpr size_t HALF = BLOCK / 2;
@@ -594,7 +753,10 @@ inline void unpackQ4(const uint8_t* packed, int8_t* out) {
 /* a . w for a Q8 weight row, the activation already in int8 */
 inline float dotQ8Q8(ActivationView a, const int8_t* w, const float* ws, size_t n) {
     const size_t blocks = n / BLOCK;
-#if defined(__AVX2__)
+#if AI_QUANT_AVX512 && defined(__AVX512F__) && defined(__AVX512BW__)
+    (void)blocks;
+    return dotQuant512(a, w, ws, n, false);
+#elif defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     for (size_t b = 0; b < blocks; ++b) {
         const __m256i av = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.q + b * BLOCK));
@@ -603,6 +765,16 @@ inline float dotQ8Q8(ActivationView a, const int8_t* w, const float* ws, size_t 
                               _mm256_set1_ps(a.s[b] * ws[b]), acc);
     }
     return sumLanes(acc);
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (size_t b = 0; b < blocks; ++b) {
+        const int8_t* av = a.q + b * BLOCK;
+        const int8_t* wv = w + b * BLOCK;
+        int32x4_t dot = dotBytesNEON(vdupq_n_s32(0), vld1q_s8(av), vld1q_s8(wv));
+        dot = dotBytesNEON(dot, vld1q_s8(av + 16), vld1q_s8(wv + 16));
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(dot), a.s[b] * ws[b]);
+    }
+    return vaddvq_f32(acc);
 #else
     float sum = 0.0f;
     for (size_t b = 0; b < blocks; ++b) {
@@ -620,7 +792,10 @@ inline float dotQ8Q8(ActivationView a, const int8_t* w, const float* ws, size_t 
 inline float dotQ4Q8(ActivationView a, const int8_t* w, const float* ws, size_t n) {
     const size_t blocks = n / BLOCK;
     const uint8_t* packed = reinterpret_cast<const uint8_t*>(w);
-#if defined(__AVX2__)
+#if AI_QUANT_AVX512 && defined(__AVX512F__) && defined(__AVX512BW__)
+    (void)blocks; (void)packed;
+    return dotQuant512(a, w, ws, n, true);
+#elif defined(__AVX2__)
     const __m128i low  = _mm_set1_epi8(0x0F);
     const __m256i bias = _mm256_set1_epi8(8);
     __m256 acc = _mm256_setzero_ps();
@@ -634,6 +809,20 @@ inline float dotQ4Q8(ActivationView a, const int8_t* w, const float* ws, size_t 
                               _mm256_set1_ps(a.s[b] * ws[b]), acc);
     }
     return sumLanes(acc);
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (size_t b = 0; b < blocks; ++b) {
+        const uint8x16_t bytes = vld1q_u8(packed + b * (BLOCK / 2));
+        const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(bytes, mask)), bias);
+        const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(bytes, 4)), bias);
+        const int8_t* av = a.q + b * BLOCK;
+        int32x4_t dot = dotBytesNEON(vdupq_n_s32(0), vld1q_s8(av), lo);
+        dot = dotBytesNEON(dot, vld1q_s8(av + 16), hi);
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(dot), a.s[b] * ws[b]);
+    }
+    return vaddvq_f32(acc);
 #else
     int8_t unpacked[BLOCK];
     float sum = 0.0f;

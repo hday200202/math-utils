@@ -103,6 +103,54 @@ static void testRegistry() {
 }
 
 
+static void testAttentionAndConfig() {
+    section("causal GQA, windows and model configuration");
+    constexpr size_t T = 19, S = 11, H = 4, KV = 2, D = 48, STRIDE = D * 2;
+    std::vector<float> q(T * H * STRIDE), k((S + T) * KV * D), v(k.size());
+    for (size_t i = 0; i < q.size(); ++i) q[i] = std::sin(float(i) * 0.13f);
+    for (size_t i = 0; i < k.size(); ++i) { k[i] = std::cos(float(i) * 0.17f); v[i] = std::sin(float(i) * 0.23f); }
+    for (size_t window : {size_t(0), size_t(1), size_t(7), size_t(200)}) {
+        std::vector<float> actual(T * H * D), serial(actual.size());
+        ai::kernels::attention(q.data(), k.data(), v.data(), actual.data(), T, S, H, KV, D, STRIDE, window);
+        ai::kernels::attention(q.data(), k.data(), v.data(), serial.data(), T, S, H, KV, D, STRIDE, window, false);
+        double worst = 0;
+        for (size_t t = 0; t < T; ++t) for (size_t h = 0; h < H; ++h) {
+            const size_t end = S + t, begin = window && end + 1 > window ? end + 1 - window : 0;
+            std::vector<double> scores(end + 1);
+            double maximum = -INFINITY, sum = 0;
+            for (size_t j = begin; j <= end; ++j) {
+                double score = 0;
+                for (size_t d = 0; d < D; ++d) score += double(q[(t * H + h) * STRIDE + d]) * k[(j * KV + h / 2) * D + d];
+                scores[j] = score / std::sqrt(double(D)); maximum = std::max(maximum, scores[j]);
+            }
+            for (size_t j = begin; j <= end; ++j) { scores[j] = std::exp(scores[j] - maximum); sum += scores[j]; }
+            for (size_t d = 0; d < D; ++d) {
+                double expected = 0;
+                for (size_t j = begin; j <= end; ++j) expected += scores[j] / sum * v[(j * KV + h / 2) * D + d];
+                worst = std::max(worst, std::fabs(actual[(t * H + h) * D + d] - expected));
+            }
+        }
+        check("threaded GQA matches FP64 at window " + std::to_string(window), worst < 2e-6 && actual == serial);
+    }
+    const std::string base = R"({"num_hidden_layers":4,"num_attention_heads":4,"hidden_size":64,"vocab_size":256,"intermediate_size":128,)";
+    const auto config = [&](const std::string& tail) { return files::json::parse(base + tail + "}").value; };
+    ai::LocalConfig cfg;
+    check("Mixtral config uses num_local_experts and intermediate_size",
+        cfg.loadFrom(config(R"("num_local_experts":4,"num_experts_per_tok":2)"), *ai::specFor("mixtral")) && cfg.numExperts == 4 && cfg.moeIntermediate == 128 && cfg.normTopK);
+    check("Qwen2 MoE preserves sparse stride, explicit dense layers and routing default",
+        cfg.loadFrom(config(R"("num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":32,"decoder_sparse_step":2,"mlp_only_layers":[3])"), *ai::specFor("qwen2_moe")) && !cfg.normTopK && cfg.denseLayer(0) && !cfg.denseLayer(1) && cfg.denseLayer(2) && cfg.denseLayer(3));
+    check("window schedule honors explicit full/sliding layer types",
+        cfg.loadFrom(config(R"("sliding_window":7,"layer_types":["full_attention","sliding_attention","full_attention","sliding_attention"])"), *ai::specFor("mistral")) && cfg.attentionWindow(0) == 0 && cfg.attentionWindow(1) == 7);
+    check("legacy linear RoPE scaling parses",
+        cfg.loadFrom(config(R"("rope_scaling":{"type":"linear","factor":4})"), *ai::specFor("llama")) && std::fabs(cfg.rotaryFrequencies[0] - .25f) < 1e-7);
+    check("Llama 3 scaling handles high, transition and low frequencies",
+        cfg.loadFrom(config(R"("head_dim":128,"rope_theta":500000,"rope_scaling":{"rope_type":"llama3","factor":8,"low_freq_factor":1,"high_freq_factor":4,"original_max_position_embeddings":8192})"), *ai::specFor("llama")) && cfg.rotaryFrequencies.front() == 1.f && cfg.rotaryFrequencies.back() < 1e-6f);
+    check("unknown RoPE scaling fails explicitly",
+        !cfg.loadFrom(config(R"("rope_scaling":{"rope_type":"unknown"})"), *ai::specFor("llama")) && cfg.error.find("unsupported RoPE") != std::string::npos);
+    check("invalid RoPE factor is rejected",
+        !cfg.loadFrom(config(R"("rope_scaling":{"rope_type":"linear","factor":0})"), *ai::specFor("llama")));
+}
+
 /* ========================================================================= //
     FP8
     The decode is a table built from the bit layout, so it is checked against
@@ -140,10 +188,18 @@ static void testCores() {
        Linux, so pinning this one would squeeze every later test onto a core */
     bool pinned = false;
     std::thread([&] { pinned = ai::cores::pinCurrentThread(usable.back()); }).join();
+#if defined(__APPLE__)
+    check("macOS reports hard CPU pinning as unsupported", !pinned);
+#else
     check("a thread can be pinned to an allowed CPU", pinned);
+#endif
 
     check("this process is seen as running",
           ai::cores::processStamp(ai::cores::selfPid()) != 0);
+    check("a live process keeps the same start stamp",
+          ai::cores::processStamp(ai::cores::selfPid())
+          == ai::cores::processStamp(ai::cores::selfPid()));
+    check("a nonexistent process has no stamp", ai::cores::processStamp(999999999) == 0);
 
     const fs::path file = fs::temp_directory_path() / "llm-testing-cores.txt";
     std::error_code ec;
@@ -692,6 +748,299 @@ static void testQwen3(const std::string& dir, const std::string& oracleDir) {
     what the model says.
 // ========================================================================= */
 
+static void testFastQuantization() {
+    section("SIMD rounding and direct FP8 quantization");
+    bool exact = true;
+    for (size_t pattern = 0; pattern < 64; ++pattern) {
+        float source[96];
+        for (size_t i = 0; i < 96; ++i) {
+            const float v = float(int((i * 29 + pattern * 17) % 255) - 127);
+            source[i] = pattern % 3 ? v / 8.f : std::nextafter(v / 8.f, pattern % 2 ? INFINITY : -INFINITY);
+        }
+        for (auto type : {ai::quant::Type::Q8, ai::quant::Type::Q4}) {
+            int8_t actual[96]{}, expected[96]{}; float scales[3];
+            ai::quant::quantizeRow(source, actual, scales, 96, type);
+            for (size_t b = 0; b < 3; ++b) {
+                float maximum = 0, extreme = 0;
+                for (size_t j = 0; j < 32; ++j) if (std::fabs(source[b * 32 + j]) > maximum) {
+                    maximum = std::fabs(source[b * 32 + j]); extreme = source[b * 32 + j];
+                }
+                const float scale = type == ai::quant::Type::Q8 ? maximum / 127.f : extreme / -8.f;
+                const float inverse = scale != 0 ? 1.f / scale : 0;
+                exact &= scales[b] == (type == ai::quant::Type::Q4 && scale == 0 ? 1.f : scale);
+                for (size_t j = 0; j < 32; ++j) {
+                    const int code = int(std::lround(source[b * 32 + j] * inverse));
+                    if (type == ai::quant::Type::Q8) expected[b * 32 + j] = int8_t(std::clamp(code, -127, 127));
+                    else expected[b * 16 + j % 16] = int8_t(uint8_t(expected[b * 16 + j % 16]) |
+                        (std::clamp(code + 8, 0, 15) << (j < 16 ? 0 : 4)));
+                }
+            }
+            exact &= std::memcmp(actual, expected, type == ai::quant::Type::Q8 ? 96 : 48) == 0;
+        }
+    }
+    check("quantizer codes and scales match independent scalar lround exactly", exact);
+#if defined(__AVX2__)
+    alignas(32) float boundaries[32];
+    for (size_t i = 0; i < 32; ++i) {
+        const float v = float(int(i) - 16) + .5f;
+        boundaries[i] = i % 3 == 0 ? std::nextafter(v, -INFINITY) : i % 3 == 1 ? v : std::nextafter(v, INFINITY);
+    }
+    alignas(32) int32_t rounded[32];
+    for (size_t i = 0; i < 32; i += 8)
+        _mm256_store_si256(reinterpret_cast<__m256i*>(rounded + i), ai::quant::roundAwayAVX2(_mm256_load_ps(boundaries + i)));
+    bool ties = true;
+    for (size_t i = 0; i < 32; ++i) ties &= rounded[i] == std::lround(boundaries[i]);
+    check("AVX2 rounding handles ties and their adjacent float values", ties);
+#endif
+    const size_t rows = 19, cols = 96;
+    auto codes = std::shared_ptr<uint8_t[]>(new uint8_t[rows * cols]);
+    auto scales = std::shared_ptr<float[]>(new float[12]);
+    for (size_t i = 0; i < rows * cols; ++i) codes[i] = uint8_t((i * 71) % 126 | (i % 2 ? 128 : 0));
+    for (size_t i = 0; i < 12; ++i) scales[i] = float(i + 1) * .003f;
+    // Tiles cross quantization blocks and the last row tile is partial.
+    const auto fp8 = ai::quant::makeFp8(codes, rows, cols, scales, 3, 4);
+    std::vector<float> wide(rows * cols);
+    for (size_t r = 0; r < rows; ++r) fp8.dequantRow(r, wide.data() + r * cols);
+    for (auto type : {ai::quant::Type::Q8, ai::quant::Type::Q4}) {
+        const auto expected = ai::quant::quantize(wide.data(), rows, cols, type);
+        const auto actual = ai::quant::quantizeFp8(fp8, type);
+        check(std::string("direct FP8-to-") + ai::quant::typeName(type) + " is byte-identical to float staging",
+            actual.valid() && std::memcmp(actual.quants.get(), expected.quants.get(), rows * cols / (type == ai::quant::Type::Q4 ? 2 : 1)) == 0 &&
+            std::memcmp(actual.scales.get(), expected.scales.get(), rows * cols / 32 * sizeof(float)) == 0);
+    }
+}
+
+static void testDeltaStep() {
+    section("fused recurrent state update");
+    for (const auto dimensions : {std::pair<size_t,size_t>{3,7}, {32,64}, {128,128}}) {
+        const auto [K,V] = dimensions;
+        for (bool channelDecay : {false,true}) {
+            std::vector<float> actual(K * V), expected(K * V), key(K), query(K), decay(K), value(V);
+            std::vector<float> output(V), reference(V), kv(V), delta(V), refKV(V), refDelta(V);
+            for (size_t i = 0; i < actual.size(); ++i) actual[i] = expected[i] = std::sin(float(i) * .3f) * .01f;
+            double worst = 0;
+            for (size_t token = 0; token < 37; ++token) {
+                for (size_t i = 0; i < K; ++i) {
+                    key[i] = std::sin(float(i + token) * .7f) / std::sqrt(float(K));
+                    query[i] = std::cos(float(i + token) * .4f) / float(K);
+                    decay[i] = .8f + float(i % 7) * .02f;
+                }
+                for (size_t d = 0; d < V; ++d) value[d] = std::sin(float(d + token) * .17f);
+                // Established four-pass implementation is independent of the
+                // fused helper; each key-channel reduction keeps its order.
+                for (size_t i = 0; i < K; ++i) for (size_t d = 0; d < V; ++d)
+                    expected[i * V + d] *= decay[channelDecay ? i : 0];
+                std::fill(refKV.begin(), refKV.end(), 0.f);
+                for (size_t i = 0; i < K; ++i) for (size_t d = 0; d < V; ++d)
+                    refKV[d] += expected[i * V + d] * key[i];
+                for (size_t d = 0; d < V; ++d) refDelta[d] = (value[d] - refKV[d]) * .35f;
+                for (size_t i = 0; i < K; ++i) for (size_t d = 0; d < V; ++d)
+                    expected[i * V + d] += key[i] * refDelta[d];
+                std::fill(reference.begin(), reference.end(), 0.f);
+                for (size_t i = 0; i < K; ++i) for (size_t d = 0; d < V; ++d)
+                    reference[d] += expected[i * V + d] * query[i];
+                ai::kernels::deltaStep(actual.data(), key.data(), query.data(), value.data(), decay.data(),
+                    channelDecay, .35f, K, V, output.data(), kv.data(), delta.data());
+                for (size_t i = 0; i < actual.size(); ++i) worst = std::max(worst, double(std::fabs(actual[i] - expected[i])));
+                for (size_t d = 0; d < V; ++d) worst = std::max(worst, double(std::fabs(output[d] - reference[d])));
+            }
+            check(std::string(channelDecay ? "channel" : "scalar") + " decay preserves state and outputs, " +
+                std::to_string(K) + "x" + std::to_string(V), worst < 1e-6);
+        }
+    }
+}
+
+static void testRecurrentMixerChunks() {
+    section("GLM recurrent mixer chunk continuity");
+    ai::LocalModel model;
+    auto& c = model.cfg;
+    c.hidden = 32; c.nLayer = 1; c.nHead = 2; c.nKVHead = 2; c.headDim = 8;
+    c.linKeyHeads = c.linValueHeads = 2; c.linKeyDim = c.linValueDim = 8; c.convKernel = 3;
+    c.mixers = {ai::MixerKind::KimiDelta}; c.linSafeGate = true;
+    ai::LocalLayer layer;
+    const auto matrix = [](size_t rows, size_t cols) {
+        ai::Weight w; w.outDim = rows; w.inDim = cols; w.f32 = ai::Tensor<float>({rows,cols});
+        for (size_t i = 0; i < rows * cols; ++i) w.f32.ptr[i] = std::sin(float(i) * .31f) * .03f;
+        return w;
+    };
+    layer.linQ = matrix(16,32); layer.linK = matrix(16,32); layer.linV = matrix(16,32);
+    layer.linFA = matrix(4,32); layer.linFB = matrix(16,4); layer.linB = matrix(2,32);
+    layer.linGA = matrix(4,32); layer.linGB = matrix(16,4); layer.linOut = matrix(32,16);
+    layer.linConv = ai::Tensor<float>({48,3}); layer.linALog = ai::Tensor<float>({2});
+    layer.linDtBias = ai::Tensor<float>({16}); layer.linNorm = ai::Tensor<float>({8});
+    std::fill(layer.linNorm.ptr, layer.linNorm.ptr + 8, 1.f);
+    for (size_t i = 0; i < 48 * 3; ++i) layer.linConv.ptr[i] = .1f * float(i % 3 + 1);
+    ai::LocalCache whole, split; whole.resize(c,32); split.resize(c,32);
+    constexpr size_t tokens = 9;
+    std::vector<float> h(tokens * 32), expected(tokens * 32), actual(tokens * 32);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = std::cos(float(i) * .17f);
+    model.kimiDeltaMixer(h.data(), layer, 0, tokens, whole, expected.data(), "", nullptr);
+    for (size_t t = 0; t < tokens; ++t)
+        model.kimiDeltaMixer(h.data() + t * 32, layer, 0, 1, split, actual.data() + t * 32, "", nullptr);
+    float worst = 0;
+    for (size_t i = 0; i < actual.size(); ++i) worst = std::max(worst, std::fabs(actual[i] - expected[i]));
+    for (size_t i = 0; i < whole.recurrent[0].size(); ++i)
+        worst = std::max(worst, std::fabs(whole.recurrent[0][i] - split.recurrent[0][i]));
+    check("GLM Kimi Delta outputs and recurrent history agree across prompt/decode chunks", worst < 1e-5);
+    // Batched and single-row linear kernels have different reduction trees.
+    float windowError = 0;
+    for (size_t i = 0; i < whole.convWindow[0].size(); ++i)
+        windowError = std::max(windowError, std::fabs(whole.convWindow[0][i] - split.convWindow[0][i]));
+    check("GLM causal convolution history survives chunking", windowError < 1e-6);
+}
+
+static void testFp8Streaming() {
+    section("FP8 checkpoint loading without full float staging");
+    const fs::path root = fs::temp_directory_path() / ("math-utils-fp8-" + std::to_string(ai::cores::selfPid()));
+    fs::create_directories(root);
+    const size_t rows = 2048, cols = 4096, bytes = rows * cols;
+    const std::string name = "model.layers.0.mlp.experts.0.gate_proj.weight";
+    std::vector<uint8_t> codes(bytes);
+    std::vector<float> scales(16 * 32);
+    for (size_t i = 0; i < bytes; ++i) codes[i] = uint8_t((i * 71 % 126) | (i % 3 ? 128 : 0));
+    for (size_t i = 0; i < scales.size(); ++i) scales[i] = float(i % 7) * .0001f;
+    // Header order deliberately differs from the physical payload order.
+    const std::string header = "{\"" + name + "_scale_inv\":{\"dtype\":\"F32\",\"shape\":[16,32],\"data_offsets\":[" +
+        std::to_string(bytes) + "," + std::to_string(bytes + scales.size() * 4) + "]},\"" + name +
+        "\":{\"dtype\":\"F8_E4M3\",\"shape\":[2048,4096],\"data_offsets\":[0," + std::to_string(bytes) + "]}}";
+    const uint64_t headerBytes = header.size();
+    { std::ofstream out(root / "model.safetensors", std::ios::binary);
+      out.write(reinterpret_cast<const char*>(&headerBytes), 8); out << header;
+      out.write(reinterpret_cast<const char*>(codes.data()), codes.size());
+      out.write(reinterpret_cast<const char*>(scales.data()), scales.size() * 4); }
+    ai::ModelWeights weights;
+    if (!weights.load(root, false, {}, ai::quant::Type::Q4)) { check("FP8 streaming fixture loads", false); std::cout << weights.error << '\n'; }
+    else {
+        const auto quantized = weights.quantTensor(name);
+        check("streaming reads tensors in payload order", weights.where.front().first == name);
+        check("streaming reports actual input bytes and conversion time",
+            weights.loadStats.inputBytes == bytes + scales.size() * 4 && weights.loadStats.conversionSeconds > 0);
+        const auto view = ai::quant::makeFp8(
+            std::shared_ptr<uint8_t[]>(std::shared_ptr<uint8_t[]>(), codes.data()), rows, cols,
+            std::shared_ptr<float[]>(std::shared_ptr<float[]>(), scales.data()), 16, 32);
+        bool exact = quantized.valid();
+        std::vector<float> wide(cols), expectedScales(cols / 32);
+        std::vector<int8_t> expected(cols / 2);
+        for (size_t row : {size_t(0),size_t(1),size_t(127),size_t(128),size_t(1000),size_t(2047)}) {
+            view.dequantRow(row, wide.data());
+            ai::quant::quantizeRow(wide.data(), expected.data(), expectedScales.data(), cols, ai::quant::Type::Q4);
+            exact &= std::memcmp(quantized.quants.get() + row * cols / 2, expected.data(), cols / 2) == 0 &&
+                std::memcmp(quantized.scales.get() + row * cols / 32, expectedScales.data(), cols / 32 * 4) == 0;
+        }
+        check("streamed FP8 quantization applies the correct per-tile scales", exact);
+        const auto plan = ai::ModelWeights::plan(root, ai::quant::Type::Q4);
+        check("FP8 load planning no longer reserves a tensor-sized float intermediate", plan.ok && plan.largestTensor < bytes * 2);
+    }
+    std::error_code ec; fs::remove_all(root, ec);
+}
+
+static void testStreamedReader() {
+    section("parallel streaming and topology selection");
+    const fs::path root = fs::temp_directory_path() / ("math-utils-stream-" + std::to_string(ai::cores::selfPid()));
+    fs::create_directories(root);
+    const fs::path file = root / "payload.bin";
+    std::vector<uint8_t> payload((size_t(8) << 20) + 73);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i * 29 + i / 101);
+    { std::ofstream out(file, std::ios::binary); out.write(reinterpret_cast<const char*>(payload.data()), payload.size()); }
+    ai::ShardReader reader;
+    ai::TensorInfo info; info.begin = 17; info.end = payload.size() - 11;
+    bool opened = reader.open(file, 0);
+    const uint8_t* bytes = opened ? reader.read(info, true) : nullptr;
+    check("parallel positioned reads reproduce a large unaligned tensor", bytes && std::memcmp(bytes, payload.data() + info.begin, info.byteCount()) == 0);
+    info.begin = 31; info.end = 59;
+    bytes = reader.read(info);
+    check("streaming buffer reuse preserves small reads", bytes && std::memcmp(bytes, payload.data() + info.begin, info.byteCount()) == 0);
+    info.begin = 0; info.end = payload.size() + 1;
+    check("parallel short reads fail instead of returning incomplete weights", reader.read(info, true) == nullptr);
+    for (size_t cpu = 0; cpu < 8; ++cpu) {
+        const fs::path topology = root / ("cpu" + std::to_string(cpu)) / "topology";
+        fs::create_directories(topology);
+        std::ofstream(topology / "physical_package_id") << cpu % 2;
+        std::ofstream(topology / "core_id") << cpu / 4;
+    }
+    check("physical-core selection distinguishes sockets and SMT siblings",
+        ai::cores::physical({0,1,2,3,4,5,6,7}, root) == std::vector<size_t>({0,1,4,5}));
+    check("physical-core selection respects restricted affinity",
+        ai::cores::physical({2,3,6,7}, root) == std::vector<size_t>({2,3,6,7}));
+    check("missing topology preserves available CPUs",
+        ai::cores::physical({0,1,99}, root) == std::vector<size_t>({0,1,99}));
+    std::error_code ec; fs::remove_all(root, ec);
+}
+
+static void testQuantDotProducts() {
+    section("quantised integer dot products");
+
+    bool q8OK = true, q4OK = true, roundingOK = true;
+    for (size_t n : {size_t(0), size_t(32), size_t(64), size_t(96), size_t(128), size_t(160), size_t(192), size_t(224), size_t(4096), size_t(16384)}) {
+        // Offset all inputs to exercise loads that are not SIMD-aligned.
+        std::vector<int8_t> a(n + 1), w(n + 1), packed(n / 2 + 1);
+        std::vector<float> as(n / 32 + 1), ws(n / 32 + 1);
+        for (unsigned pattern = 0; pattern < 5; ++pattern) {
+            for (size_t i = 0; i < n; ++i) {
+                a[i + 1] = int8_t(int((i * 73 + pattern * 19) % 255) - 127);
+                w[i + 1] = int8_t(int((i * 37 + pattern * 41) % 255) - 127);
+            }
+            for (size_t i = 0; i < n / 2; ++i)
+                packed[i + 1] = int8_t((i * 29 + pattern * 53) % 256);
+            for (size_t b = 0; b < n / 32; ++b) {
+                as[b + 1] = b % 7 == pattern ? 0.0f : 0.003f * float(1 + b % 13);
+                ws[b + 1] = 0.007f * float(1 + b % 11);
+            }
+
+            double ref8 = 0, ref4 = 0, magnitude8 = 0, magnitude4 = 0;
+            for (size_t b = 0; b < n / 32; ++b) {
+                int64_t sum8 = 0, sum4 = 0;
+                for (size_t j = 0; j < 32; ++j) {
+                    const int activation = a[1 + b * 32 + j];
+                    const unsigned byte = uint8_t(packed[1 + b * 16 + j % 16]);
+                    const int weight4 = int((byte >> (j < 16 ? 0 : 4)) & 15) - 8;
+                    sum8 += activation * int(w[1 + b * 32 + j]);
+                    sum4 += activation * weight4;
+                }
+                const double scale = double(as[b + 1]) * double(ws[b + 1]);
+                ref8 += double(sum8) * scale;
+                ref4 += double(sum4) * scale;
+                magnitude8 += std::fabs(double(sum8) * scale);
+                magnitude4 += std::fabs(double(sum4) * scale);
+            }
+            const ai::quant::ActivationView view{a.data() + 1, as.data() + 1};
+            const float got8 = ai::quant::dotQ8Q8(view, w.data() + 1, ws.data() + 1, n);
+            const float got4 = ai::quant::dotQ4Q8(view, packed.data() + 1, ws.data() + 1, n);
+            // Scale by the absolute block contributions: cancellation can
+            // make relative error against the final result meaningless.
+            q8OK &= std::fabs(double(got8) - ref8) <= 2e-6 * std::max(1.0, magnitude8);
+            q4OK &= std::fabs(double(got4) - ref4) <= 2e-6 * std::max(1.0, magnitude4);
+        }
+    }
+    check("Q8 agrees with a wide scalar reference, including signed extremes", q8OK);
+    check("Q4 agrees with a wide scalar reference, including both nibble halves", q4OK);
+
+    for (unsigned pattern = 0; pattern < 4; ++pattern) {
+        std::vector<float> x(97, 0.0f), scales(4);
+        std::vector<int8_t> q(97);
+        for (size_t i = 1; i <= 96; ++i) {
+            if (pattern == 1) x[i] = (i % 2 ? -1.0f : 1.0f) * (float(i % 31) + 0.5f);
+            if (pattern == 2) x[i] = std::sin(float(i) * 0.7f) * 3.125f;
+            if (pattern == 3) x[i] = float(int(i % 13) - 6) * 1e-12f;
+        }
+        // Unit scale gives exact +/- half-way rounding cases in pattern 1.
+        if (pattern == 1) for (size_t b = 0; b < 3; ++b) x[1 + b * 32] = -127.0f;
+        ai::quant::quantizeActivation(x.data() + 1, 96, q.data() + 1, scales.data() + 1);
+        for (size_t b = 0; b < 3; ++b) {
+            float maximum = 0;
+            for (size_t j = 0; j < 32; ++j) maximum = std::max(maximum, std::fabs(x[1 + b * 32 + j]));
+            const float scale = maximum / 127.0f;
+            const float inverse = scale > 0 ? 1.0f / scale : 0.0f;
+            roundingOK &= scales[b + 1] == scale;
+            for (size_t j = 0; j < 32; ++j) {
+                const int expected = std::clamp(int(std::lround(x[1 + b * 32 + j] * inverse)), -127, 127);
+                roundingOK &= q[1 + b * 32 + j] == expected;
+            }
+        }
+    }
+    check("activation codes match scalar lround, including zeros and half-way ties", roundingOK);
+}
+
 static void testQuantRoundTrip() {
     section("quantisation round trip");
 
@@ -1159,28 +1508,40 @@ static void testSynthetic(const std::string& dir) {
 
 
 int main(int argc, char** argv) {
+    const bool unitOnly = argc == 2 && std::string(argv[1]) == "--unit";
     const std::string gpt2Dir   = argc > 1 ? argv[1] : "models/gpt2";
     const std::string qwenDir   = argc > 2 ? argv[2] : "models/qwen3-0.6b";
     const std::string gpt2Oracle = argc > 3 ? argv[3] : "out/oracle";
     const std::string qwenOracle = argc > 4 ? argv[4] : "out/qwen-oracle";
 
     testRegistry();
+    testAttentionAndConfig();
     testCores();
     testFp8();
     testPoolAndRows();
-    testGPT2(gpt2Dir, gpt2Oracle);
-    testQwen3(qwenDir, qwenOracle);
-    testQwen3Next(argc > 5 ? argv[5] : "models/tiny-qwen3next",
-                  argc > 6 ? argv[6] : "out/qwen3next-oracle");
-    /* both norm conventions: qwen3 stores a scale that must start at one,
-       qwen3_next a deviation from one that must start at zero. A single
-       model cannot tell the two apart, so both are exercised */
-    testSynthetic(argc > 5 ? argv[5] : "models/tiny-qwen3next");
-    testSynthetic(qwenDir);
-    testPerturbed(argc > 5 ? argv[5] : "models/tiny-qwen3next");
-    testPerturbed(qwenDir);
+    testQuantDotProducts();
+    testFastQuantization();
+    testStreamedReader();
+    testDeltaStep();
+    testRecurrentMixerChunks();
+    testFp8Streaming();
     testQuantRoundTrip();
-    testQuantModel(qwenDir);
+    if (!unitOnly) {
+        testGPT2(gpt2Dir, gpt2Oracle);
+        testQwen3(qwenDir, qwenOracle);
+        testQwen3Next(argc > 5 ? argv[5] : "models/tiny-qwen3next",
+                      argc > 6 ? argv[6] : "out/qwen3next-oracle");
+        /* both norm conventions: qwen3 stores a scale that must start at one,
+           qwen3_next a deviation from one that must start at zero. A single
+           model cannot tell the two apart, so both are exercised */
+        testSynthetic(argc > 5 ? argv[5] : "models/tiny-qwen3next");
+        testSynthetic(qwenDir);
+        testPerturbed(argc > 5 ? argv[5] : "models/tiny-qwen3next");
+        testPerturbed(qwenDir);
+        testQuantModel(qwenDir);
+    } else {
+        std::cout << "\nUnit mode: checkpoint/oracle integration tests were not run.\n";
+    }
 
     std::cout << "\n"
               << (failures ? COLOR_RED : COLOR_GREEN)

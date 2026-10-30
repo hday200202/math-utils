@@ -1,6 +1,9 @@
 #pragma once
 
 #include <bit>
+#include <chrono>
+#include <cerrno>
+#include <numeric>
 #include <cstdint>
 #include <fstream>
 #include <functional>
@@ -124,6 +127,11 @@ public:
 #else
         m_fd = ::open(path.c_str(), O_RDONLY);
         m_ok = m_fd >= 0;
+#if defined(__APPLE__)
+        // Darwin has no posix_fadvise(DONTNEED). Avoid creating a second
+        // cached copy of streamed weights through this descriptor instead.
+        if (m_ok) ::fcntl(m_fd, F_NOCACHE, 1);
+#endif
 #endif
     }
 
@@ -152,6 +160,7 @@ public:
             const size_t moved = static_cast<size_t>(m_in.gcount());
 #else
             const ssize_t n = ::pread(m_fd, into + got, want, static_cast<off_t>(offset + got));
+            if (n < 0 && errno == EINTR) continue;
             const size_t moved = n > 0 ? static_cast<size_t>(n) : 0;
 #endif
             if (moved == 0) return false;
@@ -163,10 +172,11 @@ public:
     /* tells the OS it may drop its cached copy of these bytes - they have
        been copied into our own memory and the cache is now a duplicate */
     void forget(size_t offset, size_t length) {
-#if !defined(_WIN32)
+#if defined(__linux__)
         ::posix_fadvise(m_fd, static_cast<off_t>(offset), static_cast<off_t>(length),
                         POSIX_FADV_DONTNEED);
 #else
+        // macOS uses F_NOCACHE when opening the descriptor above.
         (void)offset; (void)length;
 #endif
     }
@@ -555,7 +565,7 @@ struct Safetensors {
           without the whole shard having to be resident to do it.
     */
     static Tensor<float> widenFrom(const TensorInfo& info, const uint8_t* base) {
-        Tensor<float> out(info.shape);
+        Tensor<float> out = Tensor<float>::uninitialized(info.shape);
         const size_t n = info.numel();
 
         if (info.dtype == "F32") {
@@ -710,56 +720,75 @@ struct Safetensors {
     that difference decides whether a model which only just fits can be
     loaded at all.
 
-    Reads go through std::ifstream rather than files::File because the format
-    wants a seek to an arbitrary offset, which File does not offer and which
-    is no business of a general-purpose file class.
+    FileAt provides positioned reads into uninitialized reusable storage.
+    Large tensors use independent descriptors across the persistent pool;
+    small reads and calls already inside a pool job remain serial.
 // ========================================================================= */
 
 struct ShardReader {
-    std::ifstream in;
-    size_t        payloadBegin = 0;
-    std::string   buffer;
-    std::string   error;
+    std::unique_ptr<FileAt> sequential;
+    std::vector<std::unique_ptr<FileAt>> readers;
+    fs::path path;
+    size_t payloadBegin = 0, capacity = 0;
+    std::unique_ptr<uint8_t[]> buffer;
+    std::string error;
 
-    bool open(const fs::path& path, size_t begin) {
-        error.clear();
-        payloadBegin = begin;
-        in.open(path, std::ios::binary);
-        if (!in) { error = "could not open " + path.string(); return false; }
+    bool open(const fs::path& file, size_t begin) {
+        error.clear(); path = file; payloadBegin = begin; readers.clear();
+        sequential = std::make_unique<FileAt>(path);
+        if (!sequential->ok()) { error = "could not open " + path.string(); return false; }
         return true;
     }
 
-    /*
-        read(info):
-        - the tensor's bytes, valid until the next call. Chunked for the same
-          reason File::text is: a single read of more than 2GB comes back
-          having moved nothing and sets no error flag, so a large tensor read
-          in one go silently yields zeros
-    */
-    const uint8_t* read(const TensorInfo& info) {
+    void forget(const TensorInfo& info) {
+        if (sequential) sequential->forget(payloadBegin + info.begin, info.byteCount());
+    }
+
+    // parallel=false is essential when called from an existing pool job
+    // (the scale-tensor prepass). Pool jobs must never recursively dispatch.
+    const uint8_t* read(const TensorInfo& info, bool parallel = false) {
         const size_t want = info.byteCount();
-        if (buffer.size() < want) buffer.resize(want);
-
-        in.clear();
-        in.seekg(static_cast<std::streamoff>(payloadBegin + info.begin), std::ios::beg);
-        if (!in) { error = "could not seek to the tensor"; return nullptr; }
-
-        constexpr size_t CHUNK = size_t(1) << 24;           // 16MB
-        size_t got = 0;
-        while (got < want) {
-            const size_t take = std::min(CHUNK, want - got);
-            in.read(buffer.data() + got, static_cast<std::streamsize>(take));
-            const size_t moved = static_cast<size_t>(in.gcount());
-            if (moved == 0) { error = "tensor payload is truncated"; return nullptr; }
-            got += moved;
+        if (capacity < std::max<size_t>(want, 1)) {
+            buffer.reset(); capacity = 0;
+            buffer.reset(new uint8_t[std::max<size_t>(want, 1)]); capacity = std::max<size_t>(want, 1);
         }
-
-        return reinterpret_cast<const uint8_t*>(buffer.data());
+        if (!sequential || !sequential->ok()) { error = "shard is not open"; return nullptr; }
+        if (!want) return buffer.get();
+        if (!parallel || want < (size_t(8) << 20)) {
+            if (!sequential->read(payloadBegin + info.begin, reinterpret_cast<char*>(buffer.get()), want)) {
+                error = "tensor payload is truncated or unreadable"; return nullptr;
+            }
+        } else {
+            // At least 1 MiB per reader. Reuse descriptors across tensors,
+            // keeping Windows streams private and POSIX preads independent.
+            auto& pool = kernels::Pool::instance();
+            const size_t jobs = std::min(pool.size(), want / (size_t(1) << 20));
+            while (readers.size() < jobs) {
+                auto reader = std::make_unique<FileAt>(path);
+                if (!reader->ok()) { error = "could not open parallel shard reader"; return nullptr; }
+                readers.push_back(std::move(reader));
+            }
+            std::atomic<bool> failed{false};
+            pool.run(jobs, [&](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    const auto [from, to] = kernels::Pool::slice(want, i, jobs);
+                    if (from < to && !readers[i]->read(payloadBegin + info.begin + from,
+                        reinterpret_cast<char*>(buffer.get()) + from, to - from)) failed = true;
+                }
+            });
+            if (failed) { error = "tensor payload is truncated or unreadable"; return nullptr; }
+        }
+        return buffer.get();
     }
 };
 
 
 struct ModelWeights {
+    struct LoadStats {
+        double readSeconds = 0, conversionSeconds = 0;
+        size_t inputBytes = 0;
+    } loadStats;
+
     /*
         Slot:
         - where every form of one tensor lives. A name is hashed once and the
@@ -958,6 +987,7 @@ struct ModelWeights {
         blockScales.clear();
         widen = widenToFloat;
         quantType = quantise;
+        loadStats = {};
 
         const fs::path index = directory / "model.safetensors.index.json";
         std::vector<std::string> files;
@@ -992,6 +1022,8 @@ struct ModelWeights {
 
         shards.resize(files.size());
         size_t done = 0;
+        const size_t memory = platform::totalMemory();
+        const bool forgetCopied = memory && grandTotal > memory / 2;
 
         /*
             Quantising converts every tensor into memory it owns, so the file
@@ -1010,6 +1042,7 @@ struct ModelWeights {
             std::error_code ec;
             const size_t shardBytes = static_cast<size_t>(fs::file_size(directory / files[i], ec));
 
+            const auto payloadBeginTime = std::chrono::steady_clock::now();
             const bool opened = stream
                 ? shards[i].loadHeader(directory / files[i])
                 : shards[i].load(directory / files[i], onProgress, done, grandTotal,
@@ -1020,6 +1053,11 @@ struct ModelWeights {
                 return false;
             }
 
+            if (!stream) {
+                loadStats.readSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - payloadBeginTime).count();
+                for (const auto& entry : shards[i].entries)
+                    if (!skipped(entry.first)) loadStats.inputBytes += entry.second.byteCount();
+            }
             ShardReader reader;
             if (stream && !synthesise
                 && !reader.open(directory / files[i], shards[i].payloadBegin)) {
@@ -1030,7 +1068,15 @@ struct ModelWeights {
 
             size_t shardDone = 0;
 
-            for (const auto& e : shards[i].entries) {
+            // Safetensors JSON object order need not match payload order.
+            // Read forward through the file instead of seeking by hash order.
+            std::vector<size_t> order(shards[i].entries.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return shards[i].entries[a].second.begin < shards[i].entries[b].second.begin;
+            });
+            for (size_t at : order) {
+                const auto& e = shards[i].entries[at];
                 if (skipped(e.first)) continue;
 
                 where.emplace_back(e.first, i);
@@ -1041,7 +1087,7 @@ struct ModelWeights {
                 if (synthesise || perturb) {
                     const uint8_t* source = nullptr;
                     if (perturb) {
-                        source = reader.read(e.second);
+                        source = reader.read(e.second, true);
                         if (!source) {
                             error = e.first + ": " + reader.error;
                             return false;
@@ -1060,7 +1106,11 @@ struct ModelWeights {
                 }
 
                 if (stream) {
-                    const uint8_t* bytes = reader.read(e.second);
+                    const auto readBegin = std::chrono::steady_clock::now();
+                    const uint8_t* bytes = reader.read(e.second, true);
+                    loadStats.readSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - readBegin).count();
+                    loadStats.inputBytes += e.second.byteCount();
+                    const auto convertBegin = std::chrono::steady_clock::now();
                     if (!bytes) {
                         error = e.first + ": " + reader.error;
                         return false;
@@ -1076,12 +1126,13 @@ struct ModelWeights {
                     if (worthQuantizing(e.first, e.second)) {
                         slot.quantAt = quantized.size();
                         if (e.second.dtype == "F8_E4M3") {
-                            /* FP8 has to become real values, tile scales and
-                               all, before it can be cut into blocks of 32 */
-                            const Tensor<float> wide = widenScaled(e.first, e.second, bytes);
-                            quantized.emplace_back(e.first,
-                                quant::quantize(wide.ptr, e.second.shape[0],
-                                                e.second.shape[1], quantType));
+                            const auto found = blockScales.find(e.first);
+                            const bool scaled = found != blockScales.end() && found->second.shape.size() == 2;
+                            const auto view = quant::makeFp8(
+                                std::shared_ptr<uint8_t[]>(std::shared_ptr<uint8_t[]>(), const_cast<uint8_t*>(bytes)),
+                                e.second.shape[0], e.second.shape[1], scaled ? found->second.storage : nullptr,
+                                scaled ? found->second.shape[0] : 0, scaled ? found->second.shape[1] : 0);
+                            quantized.emplace_back(e.first, quant::quantizeFp8(view, quantType));
                         } else {
                             quantized.emplace_back(e.first,
                                 quant::quantize(reinterpret_cast<const uint16_t*>(bytes),
@@ -1092,6 +1143,8 @@ struct ModelWeights {
                         slot.tensorAt = tensors.size();
                         tensors.emplace_back(e.first, widenScaled(e.first, e.second, bytes));
                     }
+                    loadStats.conversionSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - convertBegin).count();
+                    if (forgetCopied) reader.forget(e.second);
                 } else if (widen) {
                     slot.tensorAt = tensors.size();
                     if (e.second.dtype == "F8_E4M3")
@@ -1206,7 +1259,7 @@ struct ModelWeights {
             return true;
         }
 
-        Tensor<float> out(info.shape);
+        Tensor<float> out = Tensor<float>::uninitialized(info.shape);
         for (size_t i = 0; i < n; ++i)
             out.ptr[i] = std::bit_cast<float>(static_cast<uint32_t>(narrowed[i]) << 16);
 
@@ -1296,7 +1349,7 @@ struct ModelWeights {
             scaled ? found->second.storage : nullptr,
             scaled ? found->second.shape[0] : 0, scaled ? found->second.shape[1] : 0);
 
-        Tensor<float> out(info.shape);
+        Tensor<float> out = Tensor<float>::uninitialized(info.shape);
         kernels::Pool::instance().run(rows, [&](size_t begin, size_t end) {
             for (size_t r = begin; r < end; ++r) view.dequantRow(r, out.ptr + r * cols);
         });
@@ -1516,10 +1569,13 @@ struct ModelWeights {
                     ARE the weights, aliased rather than converted
                 */
                 if (streaming) {
-                    /* FP8 is widened to float before it is quantised, so
-                       while it is in flight it costs that copy as well */
-                    const size_t inFlight = e.second.byteCount()
-                        + (e.second.dtype == "F8_E4M3" ? e.second.numel() * sizeof(float) : 0);
+                    // FP8 conversion uses one float row per worker, not a
+                    // tensor-sized FP32 intermediate. Unquantized matrices
+                    // still need their complete widened destination.
+                    const size_t scratch = e.second.dtype == "F8_E4M3" && worthQuantizing(e.first, e.second)
+                        ? e.second.shape[1] * sizeof(float) * std::max<size_t>(1, std::thread::hardware_concurrency())
+                        : 0;
+                    const size_t inFlight = e.second.byteCount() + scratch;
                     out.largestTensor = std::max(out.largestTensor, inFlight);
                 }
 

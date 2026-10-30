@@ -112,11 +112,15 @@ static void usage() {
         << "  --q8 / --q4  quantise the weight matrices as they load, so a model\n"
         << "               too large to hold in bfloat16 still fits. About half\n"
         << "               the size for q8, under a third for q4.\n"
-        << "  --cores C    which CPUs to run on, one pinned thread each: a list such\n"
+        << "  --load-only  load and report timings, then exit before allocating a KV cache.\n"
+        << "  --profile    print loading and per-stage prompt/decode timings.\n"
+        << "  --cores C    worker CPU list (hard pinning on Linux/Windows): a list such\n"
         << "               as 0-31 or 0-15,32-47, \"all\", or \"auto\" (the default) for\n"
         << "               every CPU no other running llm has claimed. Claims are\n"
         << "               kept in llm-cores.txt beside this executable, so a second\n"
-        << "               instance started with auto stays off the first one's CPUs.\n"
+        << "               instance started with auto selects unclaimed worker slots.\n"
+        << "               \"physical\" selects one allowed thread per core on Linux.\n"
+        << "               macOS controls worker count only; the OS places threads.\n"
         << "\n"
         << "  <model-dir>  a folder holding config.json, the .safetensors,\n"
         << "               and a tokenizer. The architecture is read from\n"
@@ -226,6 +230,8 @@ int main(int argc, char** argv) {
     bool     force = false;
     ai::quant::Type quantType = ai::quant::Type::None;
     bool useGpu = false;
+    bool profileRun = false;
+    bool loadOnly = false;
     double vramCapGB = 0.0;
     std::string systemPrompt = DEFAULT_SYSTEM;
     std::string effort;            // empty = do not think at all
@@ -267,6 +273,8 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--q8")                 { quantType = ai::quant::Type::Q8; }
         else if (arg == "--q4")                 { quantType = ai::quant::Type::Q4; }
+        else if (arg == "--load-only")          { loadOnly = true; }
+        else if (arg == "--profile")            { profileRun = true; }
         else if (arg == "--gpu")                { useGpu = true; }
         else if (arg == "--vram"   && hasNext)  { useGpu = true; vramCapGB = std::strtod(argv[++i], nullptr); }
         else if (!arg.empty() && arg[0] != '-' && modelDir.empty()) { modelDir = arg; }
@@ -366,6 +374,10 @@ int main(int argc, char** argv) {
 
     if (!coresNote.empty()) std::cout << coresNote << "\n";
     ai::kernels::Pool::configure(cpus);
+#if defined(__APPLE__)
+    std::cout << "note: macOS schedules worker threads; --cores controls worker count\n"
+                 "      and coordinates instances, but cannot reserve physical CPUs.\n";
+#endif
 
     using clock = std::chrono::steady_clock;
 
@@ -539,6 +551,27 @@ int main(int argc, char** argv) {
         std::cout << "note: --effort has no effect here. This model's chat template has no\n"
                   << "      <think> block, so there is no scratchpad to spend it in.\n";
 
+    model.profile.enabled = profileRun;
+    if (profileRun) {
+        const auto& load = model.weights.loadStats;
+        std::cout << "  load payload: " << formatBytes(load.inputBytes)
+                  << ", read/place " << load.readSeconds << "s, conversion " << load.conversionSeconds
+                  << "s, arranging " << model.arrangeSeconds << "s\n";
+        std::cout << "  integer kernels: "
+#if AI_QUANT_AVX512 && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                  << "AVX-512 VNNI"
+#elif AI_QUANT_AVX512 && defined(__AVX512BW__)
+                  << "AVX-512 BW"
+#elif defined(__AVX2__)
+                  << "AVX2"
+#elif defined(__aarch64__)
+                  << "ARM64 Neon"
+#else
+                  << "portable"
+#endif
+                  << "\n";
+    }
+
     if (context > model.cfg.maxPositions) context = model.cfg.maxPositions;
 
     /* a base model has no chat tokens, so wrapping its input in a template
@@ -602,6 +635,8 @@ int main(int argc, char** argv) {
                       << "               hold and rounded away; try a larger --random\n";
     }
 
+    if (loadOnly) return 0;
+
     ai::LocalCache cache;
     cache.resize(model.cfg, context);
 
@@ -619,7 +654,9 @@ int main(int argc, char** argv) {
         - the cache carries across turns, so a follow-up only pays for its own
           tokens rather than reprocessing the conversation
     */
+    ai::LocalProfile promptProfile, decodeProfile;
     const auto run = [&](const std::string& userText) {
+        if (useGpu) ai::gpu::resetCounters();
         /*
             Rendered here rather than by the caller because both the wrapper
             tokens and the system preamble belong to the START of a
@@ -646,10 +683,12 @@ int main(int argc, char** argv) {
             ids = build();
         }
 
+        model.profile.reset();
         const clock::time_point prefillBegin = clock::now();
         model.forward(ids.data(), ids.size(), cache.length, cache, logits.data());
         lastPrefill = std::chrono::duration<double>(clock::now() - prefillBegin).count();
         lastPrompt = ids.size();
+        promptProfile = model.profile; model.profile.reset();
 
         const clock::time_point decodeBegin = clock::now();
         size_t produced = 0;
@@ -669,6 +708,7 @@ int main(int argc, char** argv) {
 
         lastDecode = std::chrono::duration<double>(clock::now() - decodeBegin).count();
         lastProduced = produced;
+        decodeProfile = model.profile;
         std::cout << std::endl;
     };
 
@@ -678,6 +718,23 @@ int main(int argc, char** argv) {
                   << "   generated " << lastProduced << " tok in " << lastDecode << "s ("
                   << (lastProduced / (lastDecode > 0 ? lastDecode : 1)) << " tok/s)"
                   << "   context " << cache.length << "/" << context << std::endl;
+        if (profileRun) {
+            std::cout << "  stage                              prompt(s)   decode(s)\n";
+            for (size_t stage = 0; stage < ai::LocalProfile::Count; ++stage) {
+                if (!promptProfile.calls[stage] && !decodeProfile.calls[stage]) continue;
+                char line[160];
+                std::snprintf(line, sizeof(line), "  %-33s %9.4f   %9.4f\n", ai::LocalProfile::name(stage),
+                    promptProfile.seconds[stage], decodeProfile.seconds[stage]);
+                std::cout << line;
+            }
+        }
+        if (useGpu) {
+            const ai::gpu::Counters counters = ai::gpu::counters();
+            if (counters.launches)
+                std::cout << "  GPU " << counters.launches << " dispatches, "
+                          << counters.kernelSeconds << "s executing, "
+                          << counters.transferSeconds << "s copying activations\n";
+        }
     };
 
     if (!oneShot.empty()) {

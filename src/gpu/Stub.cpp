@@ -56,4 +56,11 @@ void aigpu_counters(AiGpuCounters* out) {
 
 void aigpu_reset_counters(void) {}
 
+int aigpu_dense_supported(void) { return 0; }
+void* aigpu_dense_create(const AiGpuDenseConfig*, const AiGpuDenseLayer*,
+    const float* const*, const float* const*, uint32_t) { return nullptr; }
+void aigpu_dense_release(void*) {}
+void aigpu_dense_decode(void*, const float*, float*, uint32_t) {}
+void aigpu_dense_read_cache(void*, float* const*, float* const*, uint32_t) {}
+
 } // !extern "C"

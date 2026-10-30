@@ -25,6 +25,17 @@ template <typename T> struct Tensor {
     }
 
 
+    // Only for callers that overwrite every element before reading it.
+    // The ordinary constructor deliberately retains zero initialization.
+    static Tensor uninitialized(std::vector<size_t> dimensions) {
+        Tensor out;
+        out.shape = std::move(dimensions);
+        out.strides = defaultStrides(out.shape);
+        out.storage = std::make_shared_for_overwrite<T[]>(out.numel());
+        out.ptr = out.storage.get();
+        return out;
+    }
+
     static std::vector<size_t> defaultStrides(const std::vector<size_t>& shape) {
         size_t n = shape.size();
         if (n == 0) return {};

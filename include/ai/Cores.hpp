@@ -17,6 +17,9 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
+#elif defined(__APPLE__)
+    #include <libproc.h>
+    #include <unistd.h>
 #else
     #include <sys/syscall.h>
     #include <unistd.h>
@@ -36,6 +39,9 @@
     So each instance pins its workers to a set of CPUs and records that set
     in a small claims file beside the executable. An instance asked to pick
     its own ("auto") takes whatever the others have not claimed.
+
+    macOS has no equivalent hard CPU affinity. There, the lists coordinate
+    worker counts only; placement and sharing remain the scheduler's choice.
 */
 
 namespace ai {
@@ -128,7 +134,7 @@ inline std::vector<size_t> allowed() {
 #if defined(_WIN32)
     const DWORD total = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     for (DWORD i = 0; i < total; ++i) out.push_back(i);
-#else
+#elif defined(__linux__)
     /* the raw syscall rather than sched_getaffinity(): that one and the
        CPU_SET macros are only declared under _GNU_SOURCE, which not every
        compiler defines */
@@ -149,6 +155,24 @@ inline std::vector<size_t> allowed() {
     return out;
 }
 
+// One allowed hardware thread per physical core. CPU numbering alone is
+// insufficient: sockets and SMT siblings can be interleaved arbitrarily.
+inline std::vector<size_t> physical(const std::vector<size_t>& usable,
+                                  const fs::path& root = "/sys/devices/system/cpu") {
+    std::vector<std::pair<int, int>> seen;
+    std::vector<size_t> out;
+    for (size_t cpu : usable) {
+        const fs::path topology = root / ("cpu" + std::to_string(cpu)) / "topology";
+        int socket = -1, core = -1;
+        std::ifstream packageFile(topology / "physical_package_id"), coreFile(topology / "core_id");
+        if (!(packageFile >> socket) || !(coreFile >> core) || socket < 0 || core < 0)
+            return usable; // topology unavailable; do not guess CPU numbering
+        const std::pair<int, int> id{socket, core};
+        if (std::find(seen.begin(), seen.end(), id) == seen.end()) { seen.push_back(id); out.push_back(cpu); }
+    }
+    return out;
+}
+
 /*
     parse(spec, cpus, error):
     - "all" for every CPU allowed(), or a list - which must name only CPUs
@@ -158,6 +182,7 @@ inline std::vector<size_t> allowed() {
 inline bool parse(const std::string& spec, std::vector<size_t>& cpus, std::string& error) {
     const std::vector<size_t> usable = allowed();
     if (spec == "all") { cpus = usable; return true; }
+    if (spec == "physical") { cpus = physical(usable); return !cpus.empty(); }
 
     if (!parseList(spec, cpus, error)) return false;
 
@@ -189,6 +214,11 @@ inline bool pinCurrentThread(size_t cpu) {
         }
         cpu -= n;
     }
+    return false;
+#elif defined(__APPLE__)
+    // Darwin affinity tags are cache-sharing hints, not CPU IDs. Do not
+    // pretend that they provide the hard pinning this interface promises.
+    (void)cpu;
     return false;
 #else
     /* pid 0 in the raw syscall is the calling THREAD, not the process */
@@ -234,6 +264,12 @@ inline uint64_t processStamp(uint64_t pid) {
 
     CloseHandle(h);
     return stamp;
+#elif defined(__APPLE__)
+    proc_bsdinfo info{};
+    const int bytes = proc_pidinfo(static_cast<int>(pid), PROC_PIDTBSDINFO,
+                                   0, &info, sizeof(info));
+    if (bytes != sizeof(info)) return 0;
+    return info.pbi_start_tvsec * uint64_t(1000000) + info.pbi_start_tvusec + 1;
 #else
     /* field 22 of /proc/<pid>/stat is the start time in clock ticks. The
        command name in field 2 can contain spaces and parentheses, so count

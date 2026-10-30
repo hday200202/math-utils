@@ -96,6 +96,9 @@ template <typename T> struct Vec3 {
     const T& operator[](int i) const { return data()[i]; }
 };
 
+// Anonymous-union members do not supply portable aggregate deduction guides.
+template <typename T> Vec3(T, T, T) -> Vec3<T>;
+
 using Vec3f = Vec3<float>;
 using Vec3d = Vec3<double>;
 using Vec3i = Vec3<int32_t>;
@@ -152,6 +155,8 @@ template <typename T> struct Vec4 {
     T& operator[](int i) { return data()[i]; }
     const T& operator[](int i) const { return data()[i]; }
 };
+
+template <typename T> Vec4(T, T, T, T) -> Vec4<T>;
 
 using Vec4f = Vec4<float>;
 using Vec4d = Vec4<double>;

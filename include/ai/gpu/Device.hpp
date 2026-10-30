@@ -30,21 +30,21 @@
     than one that happens to be stricter than Linux requires.
 
     src/gpu/Stub.cpp implements the same C entry points with available() ==
-    false, so a build without ROCm compiles and runs unchanged on the CPU
-    path.
+    false, so a CPU-only build needs neither Metal nor ROCm. Metal.mm
+    implements the same interface on Apple GPUs without exposing Objective-C
+    types to the model.
 
-    WHAT THIS STAGE DOES
+    The general matmul interface uploads activations and returns results
+    synchronously. Its counters distinguish execution from copying. On Metal,
+    compatible dense models also use the optional resident decoder in
+    DeviceABI.h: one command buffer per token, with intermediates and KV
+    history kept on the GPU. The synchronous interface remains the fallback
+    for prompt processing, traces and unsupported architectures.
 
-    Weights are uploaded once at load and the matmuls run on the GPU. The
-    activations still live in host memory, so every matmul is
-    upload-launch-download. That is deliberately visible rather than hidden:
-    counters() reports transfer time separately from kernel time, because
-    the ratio between those two numbers is the entire argument for moving
-    the residual stream onto the device as well.
+    Buffers are opaque backend handles. They need not be raw device addresses;
+    Metal wraps an MTLBuffer and its allocation size. Callers must never do
+    pointer arithmetic on Buffer::ptr().
 
-    A 40-layer model does 7 matmuls per layer plus the head, so a single
-    token crosses the bus about 560 times. The kernel time will look
-    excellent and the wall clock will not, and the counters say why.
 */
 
 namespace ai {
@@ -53,7 +53,7 @@ namespace gpu {
 /* ========================================================================= //
     Buffer
 
-    An allocation in VRAM. The destructor is inline and calls the backend's
+    A backend-owned GPU allocation (shared memory on Apple silicon). The destructor is inline and calls the backend's
     C free, so whoever allocated the memory is who frees it - the rule that
     makes it safe for the two sides to have been built by different
     compilers with different allocators.

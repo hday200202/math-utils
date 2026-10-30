@@ -14,9 +14,48 @@ compiled in, so one build runs every supported model.
 
 ## Building
 
+On macOS, install Xcode Command Line Tools (`xcode-select --install`) or
+Xcode, then use the same build command below. The default compiler is
+Apple Clang; it must support `-std=c++26` and libc++'s `<format>`.
+`CXX`, `CXXSTD`, `CPPFLAGS`, `CXXFLAGS` and `LDFLAGS` can be overridden.
+
 ```
 make release-llm
 ```
+
+On macOS, the build selects **Metal** when `xcrun metal` and `xcrun metallib`
+are available. Otherwise it builds the CPU backend. Metal requires an Apple
+GPU (M1 or newer). The shaders are compiled offline and embedded into the
+executable; there are no runtime shader files to install.
+
+```
+make release-llm BACKEND=metal
+./bin/release/llm models/qwen3-8b --q4 --gpu --ctx 1024
+```
+
+`BACKEND=cpu` or `GPU=0` builds without Metal or HIP. Omitting `--gpu` runs
+the CPU path even when the executable includes Metal. See
+[Apple GPU implementation](apple-gpu-plan.md) for execution details,
+measurements and remaining limits.
+
+On macOS, `--cores` selects the worker count and coordinates that count
+between instances. Darwin does not expose hard pinning to numbered CPUs;
+the OS schedules the workers, so disjoint lists do not reserve disjoint
+physical cores. Process claims still use real PID/start-time pairs.
+Checkpoint streaming uses Darwin's per-descriptor `F_NOCACHE` instead of
+Linux's `posix_fadvise` cache hints.
+
+ARM64 quantized decode uses Neon kernels for Q4/Q8 dot products and
+activation quantization. Builds targeting the dot-product extension use
+signed `SDOT`; other ARM64 targets use widening Neon multiplies. Activation
+rounding preserves the scalar `lround` rule, including half-way ties. The
+release build's `-march=native` selects the current Mac's features.
+
+On an M5 Pro, a batch-one Q4 matmul with 32,768 output rows, 4,096 inputs
+and 18 threads fell from 3.07 ms to 0.35 ms (minimum of five timed runs
+after warm-up, 80 MiB of quantized weights). Q8 was roughly unchanged.
+This measures the decode kernel, not model loading, tiled prompt processing,
+recurrent attention or swapping; it is not a whole-model speedup claim.
 
 There is one `llm` binary, not a CPU one and a GPU one. `include/ai/gpu/Device.hpp`
 is plain C++ with no HIP types in it, so every translation unit compiles the
@@ -24,15 +63,19 @@ same way everywhere and only the *backend* changes at link time:
 
 | | |
 |---|---|
+| macOS with Metal tools | `src/gpu/Metal.mm` and embedded Metal kernels |
 | ROCm present | `src/gpu/Kernels.hip` through `hipcc`, linked in |
-| ROCm absent | `src/gpu/Stub.cpp`, where `available()` returns false |
+| Neither backend available, or CPU explicitly selected | `src/gpu/Stub.cpp`, where `available()` returns false |
 
 The stub is not a stripped-down build. `--gpu` still parses, still asks for a
 device, and is told no — the same path taken when a card is present but out of
 memory. One behaviour to reason about instead of two.
 
 ```
-make release-llm                    use the GPU if this machine has one
+make release-llm                   build the available backend; --gpu enables it
+make release-llm BACKEND=metal     Apple GPU backend
+make release-llm BACKEND=cpu       CPU-only build
+make release-llm BACKEND=hip       require the HIP backend
 make release-llm GPU=0              no-device build even where ROCm exists
 make release-llm GPU_ARCH=gfx1030   a card that is not RDNA3
 make release-llm HIPCC=/path/hipcc  ROCm somewhere other than /opt/rocm
@@ -40,9 +83,8 @@ make release-llm HIPCC=/path/hipcc  ROCm somewhere other than /opt/rocm
 
 `GPU_ARCH` must match the card. `rocminfo | grep gfx` will tell you.
 
-Nothing outside `src/gpu/` knows the GPU exists, so on a machine with no ROCm
-at all the build is exactly what it was before any of this: `g++ -std=c++26`,
-no flags, no dependencies.
+Metal and HIP types stay inside `src/gpu/`. The model uses the shared C ABI
+and its plain C++ wrappers. CPU-only builds require no GPU SDK.
 
 ## Getting a model
 
@@ -55,11 +97,28 @@ Downloads only what is needed: `config.json`, a tokenizer, `tokenizer_config.jso
 for its chat template, and the shards named by the index. `--check` prints the
 size and the estimated speed before committing to the download.
 
-Supported architectures: `gpt2`, `llama`, `mistral`, `qwen2`, `qwen3`,
-`qwen3_5`, `qwen3_next`, `phi3`. Anything else is refused at load with the
-reason, rather than running and producing nonsense.
+Supported architecture registrations: `gpt2`, `llama`, `mistral`, `qwen2`,
+`qwen3`, `phi3`, `qwen3_5`, `qwen3_5_text`, `qwen3_next`, `qwen3_moe`,
+`mixtral`, `qwen2_moe`, `glm5_next` and `glm5_next_text`. The download helper
+uses the same list.
+
+Mixtral maps its `block_sparse_moe` expert matrices and `num_local_experts`;
+Qwen2 MoE supports its gated shared expert, unnormalized routing default,
+`decoder_sparse_step` and `mlp_only_layers`. Both have independent synthetic
+NumPy checks for CPU and GPU; full trained checkpoints have not been tested.
+
+Default, linear and Llama 3.1/3.2 RoPE scaling and per-layer sliding windows
+are implemented. Other scaling modes (including YaRN, dynamic NTK and
+LongRoPE) are explicitly rejected rather than silently using incorrect
+positions. A registered architecture does not imply every checkpoint variant
+or tokenizer is supported. The existing latent-attention RoPE limitation also
+remains; multimodal registrations run their text tower only.
 
 ---
+
+For dual-socket CPU servers, see [CPU server performance](cpu-server-performance.md)
+for `--cores physical`, `--profile`, `--load-only`, FP8 loading changes and
+server validation commands.
 
 ## Fitting a model
 
@@ -298,9 +357,34 @@ to stay resident, which `--q8` / `--q4` reduce. Try those before `--force`.
 ## Test suites
 
 ```
+make test-unit                  no model downloads; Python 3 + NumPy required
 make test                       architecture and model correctness
 make gpu-test                   GPU kernels, CPU/GPU agreement, quality
 ```
+
+GPU checks can also use a generated checkpoint with no model download:
+
+```
+python3 tools/make_gpu_fixture.py /tmp/math-utils-gpu-fixture
+./bin/release/gpu-testing /tmp/math-utils-gpu-fixture
+./bin/release/gpu-testing --resident-only models/qwen3-8b
+```
+
+The generated model tests numerical behavior and lifecycle, not language
+quality. `--resident-only` checks real Q4 logits against the established
+per-operation GPU path, independent conversation copies, follow-up prompts,
+resets, the attention partition boundary and exact CPU history restoration,
+without loading duplicate full-precision 8B weights.
+
+`tools/make_gpu_fixture.py --model-type mixtral|qwen2_moe|qwen2|llama` also
+generates independent NumPy logit references. Run
+`gpu-testing --fixture DIRECTORY` to check them; `--rope linear|llama3` and
+`--window N` exercise positional scaling and attention masks.
+
+`test-unit` generates the small NumPy tensor fixtures, then runs quaternion,
+tensor, JSON and LLM unit checks. JSON and LLM use explicit `--unit` modes
+that omit checkpoint/oracle integration checks; the ordinary test commands
+still require those files and fail if required inputs are missing.
 
 `llm-testing` builds against the stub and needs no ROCm — it tests the loader
 and the model. `gpu-testing` genuinely needs a card and says so if one is

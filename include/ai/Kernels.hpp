@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <vector>
 
 #include "ThreadPool.hpp"
@@ -97,6 +98,74 @@ inline float dotBF16(const float* a, const uint16_t* b, size_t n) {
     return sum;
 }
 
+
+// DeltaNet state update, with scalar or per-key-channel decay. Fuse decay
+// with prediction and the rank-one update with the query reduction: two
+// state traversals instead of four, preserving each channel's reduction order.
+inline void deltaStep(float* state, const float* key, const float* query,
+                      const float* value, const float* decay, bool perKeyDecay,
+                      float beta, size_t keys, size_t values, float* out,
+                      float* prediction, float* delta) {
+    std::fill(prediction, prediction + values, 0.0f);
+    for (size_t i = 0; i < keys; ++i) {
+        float* row = state + i * values;
+        const float a = decay[perKeyDecay ? i : 0], k = key[i];
+        for (size_t d = 0; d < values; ++d) {
+            row[d] *= a;
+            prediction[d] += row[d] * k;
+        }
+    }
+    for (size_t d = 0; d < values; ++d) delta[d] = (value[d] - prediction[d]) * beta;
+    std::fill(out, out + values, 0.0f);
+    for (size_t i = 0; i < keys; ++i) {
+        float* row = state + i * values;
+        const float k = key[i], q = query[i];
+        for (size_t d = 0; d < values; ++d) {
+            row[d] += k * delta[d];
+            out[d] += row[d] * q;
+        }
+    }
+}
+
+// Each query/head owns its output and scratch. Static slices preserve the
+// summation order while using the persistent pool for substantial contexts.
+inline void attention(const float* q, const float* keys, const float* values, float* out,
+                      size_t count, size_t start, size_t heads, size_t kvHeads,
+                      size_t dim, size_t qStride, size_t window = 0, bool threaded = true) {
+    const size_t tasks = count * heads, kw = kvHeads * dim;
+    const float scale = 1.0f / std::sqrt(float(dim));
+    const auto body = [&](size_t begin, size_t end) {
+        std::vector<float> scores(start + count);
+        for (size_t task = begin; task < end; ++task) {
+            const size_t token = task / heads, head = task % heads;
+            const size_t position = start + token;
+            const size_t first = window && position + 1 > window ? position + 1 - window : 0;
+            const size_t kv = head / (heads / kvHeads);
+            const float* query = q + task * qStride;
+            float maximum = -INFINITY;
+            for (size_t j = first; j <= position; ++j) {
+                scores[j] = dot(query, keys + j * kw + kv * dim, dim) * scale;
+                maximum = std::max(maximum, scores[j]);
+            }
+            float sum = 0;
+            for (size_t j = first; j <= position; ++j) {
+                scores[j] = std::exp(scores[j] - maximum); sum += scores[j];
+            }
+            float* dst = out + task * dim;
+            std::fill(dst, dst + dim, 0.0f);
+            const float inv = 1.0f / sum;
+            for (size_t j = first; j <= position; ++j) {
+                const float w = scores[j] * inv;
+                const float* v = values + j * kw + kv * dim;
+                for (size_t d = 0; d < dim; ++d) dst[d] += w * v[d];
+            }
+        }
+    };
+    // Avoid waking the whole pool for short single-token attention.
+    if (threaded && tasks > 1 && double(count) * heads * (start + (count + 1) / 2) * dim >= 262144)
+        Pool::instance().run(tasks, body);
+    else body(0, tasks);
+}
 
 /* ========================================================================= //
     Matmul against a transposed right operand

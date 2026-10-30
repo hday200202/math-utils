@@ -1,5 +1,6 @@
 #include <iostream>
 #include <chrono>
+#include <vector>
 
 #include "../include/datetime/Datetime.hpp"
 #include "../include/structs/LinkedList.hpp"

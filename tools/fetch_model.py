@@ -33,7 +33,8 @@ BASE = "https://huggingface.co"
 # its own list on a mismatch, so a stale entry here refuses a download the
 # engine could have run - which is exactly what happened with qwen3_moe.
 SUPPORTED = {"gpt2", "llama", "mistral", "qwen2", "qwen3", "phi3",
-             "qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_moe"}
+             "qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_moe",
+             "mixtral", "qwen2_moe", "glm5_next", "glm5_next_text"}
 
 # these carry a bank of experts. The loader routes them, so the presence of
 # experts is no longer a reason to refuse - but only for types that are in

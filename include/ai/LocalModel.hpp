@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <atomic>
 #include <bit>
 #include <optional>
@@ -8,6 +10,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -411,6 +414,36 @@ inline ArchSpec qwen3MoeSpec() {
     return s;
 }
 
+// Mixtral uses the same normalized top-k router, with different expert names.
+inline ArchSpec mixtralSpec() {
+    ArchSpec s = qwen3MoeSpec();
+    s.modelType = "mixtral";
+    s.qkNorm = false;
+    s.names.qNorm.clear(); s.names.kNorm.clear();
+    s.names.router = "model.layers.{L}.block_sparse_moe.gate.weight";
+    s.names.expertGate = "model.layers.{L}.block_sparse_moe.experts.{E}.w1.weight";
+    s.names.expertUp = "model.layers.{L}.block_sparse_moe.experts.{E}.w3.weight";
+    s.names.expertDown = "model.layers.{L}.block_sparse_moe.experts.{E}.w2.weight";
+    return s;
+}
+
+inline ArchSpec qwen2MoeSpec() {
+    ArchSpec s = qwen2Spec();
+    s.modelType = "qwen2_moe";
+    s.mlp = MLPKind::MoE;
+    const ArchSpec experts = qwen3NextSpec();
+    s.names.router = experts.names.router;
+    s.names.expertGate = experts.names.expertGate;
+    s.names.expertUp = experts.names.expertUp;
+    s.names.expertDown = experts.names.expertDown;
+    s.names.sharedGate = experts.names.sharedGate;
+    s.names.sharedUp = experts.names.sharedUp;
+    s.names.sharedDown = experts.names.sharedDown;
+    s.names.sharedScale = experts.names.sharedScale;
+    // Keep the dense templates for mlp_only_layers and decoder_sparse_step.
+    return s;
+}
+
 /*
     glm5NextSpec():
     - GLM-5.3-Flash. Three of every four layers are Kimi Delta Attention and
@@ -555,6 +588,8 @@ inline const std::vector<ArchSpec>& specRegistry() {
         qwen35Spec("qwen3_5_text"),
         qwen3NextSpec(),
         qwen3MoeSpec(),
+        mixtralSpec(),
+        qwen2MoeSpec(),
         glm5NextSpec("glm5_next"),
         glm5NextSpec("glm5_next_text"),
     };
@@ -605,6 +640,13 @@ struct LocalConfig {
         and the remaining 192 are left alone
     */
     float  partialRotary = 1.0f;
+    std::vector<float> rotaryFrequencies;
+    std::vector<size_t> attentionWindows;
+    std::string error;
+
+    size_t attentionWindow(size_t layer) const {
+        return layer < attentionWindows.size() ? attentionWindows[layer] : 0;
+    }
 
     /* what an untrained matrix is drawn from, for the synthetic loader */
     float  initRange = 0.02f;
@@ -706,6 +748,8 @@ struct LocalConfig {
     size_t group()   const { return nHead / nKVHead; }
 
     bool loadFrom(const files::json::Value& c, const ArchSpec& spec) {
+        error.clear();
+        partialRotary = 1.0f;
         const ConfigKeys& k = spec.keys;
 
         nLayer  = c[k.nLayer].asSize(0);
@@ -741,6 +785,50 @@ struct LocalConfig {
         partialRotary = static_cast<float>(
             c["partial_rotary_factor"].asDouble(partialRotary));
 
+        // Resolve static RoPE frequencies once, shared by CPU and Metal.
+        // Unknown scaling is rejected rather than silently changing positions.
+        const auto& scaling = rope.isObject() ? rope : c["rope_scaling"];
+        const std::string ropeType = scaling["rope_type"].asString(scaling["type"].asString("default"));
+        const float factor = float(scaling["factor"].asDouble(1.0));
+        const float low = float(scaling["low_freq_factor"].asDouble(1.0));
+        const float high = float(scaling["high_freq_factor"].asDouble(4.0));
+        const float original = float(scaling["original_max_position_embeddings"].asDouble(0));
+        if (ropeType != "default" && ropeType != "linear" && ropeType != "llama3") {
+            error = "unsupported RoPE scaling: " + ropeType;
+            return false;
+        }
+        if (!std::isfinite(ropeTheta) || ropeTheta <= 0 || !std::isfinite(partialRotary) ||
+            partialRotary <= 0 || partialRotary > 1 || !std::isfinite(factor) || factor < 1 ||
+            (ropeType == "llama3" && (!std::isfinite(original) || original <= 0 ||
+                !std::isfinite(low) || !std::isfinite(high) || low <= 0 || high <= low))) {
+            error = "invalid rotary position parameters";
+            return false;
+        }
+        rotaryFrequencies.resize(rotaryDims() / 2);
+        for (size_t j = 0; j < rotaryFrequencies.size(); ++j) {
+            float frequency = 1.0f / std::pow(ropeTheta, float(2 * j) / float(rotaryDims()));
+            if (ropeType == "linear") frequency /= factor;
+            if (ropeType == "llama3") {
+                const float wavelength = 6.283185307179586f / frequency;
+                if (wavelength > original / low) frequency /= factor;
+                else if (wavelength >= original / high) {
+                    const float blend = (original / wavelength - low) / (high - low);
+                    frequency *= (1 - blend) / factor + blend;
+                }
+            }
+            rotaryFrequencies[j] = frequency;
+        }
+        attentionWindows.assign(nLayer, 0);
+        const size_t window = c["sliding_window"].asSize(0);
+        const bool windowEnabled = c["use_sliding_window"].asBool(true);
+        const size_t firstWindow = c["max_window_layers"].asSize(0);
+        const auto& layerTypes = c["layer_types"];
+        for (size_t i = 0; i < nLayer; ++i) {
+            const bool useWindow = layerTypes.isArray() && i < layerTypes.size()
+                ? layerTypes[i].asString() == "sliding_attention" : windowEnabled && i >= firstWindow;
+            if (useWindow) attentionWindows[i] = window;
+        }
+
         linKeyHeads   = c["linear_num_key_heads"].asSize(0);
         linValueHeads = c["linear_num_value_heads"].asSize(0);
         linKeyDim     = c["linear_key_head_dim"].asSize(0);
@@ -748,11 +836,11 @@ struct LocalConfig {
         convKernel    = c["linear_conv_kernel_dim"].asSize(0);
 
         /* Qwen says num_experts, DeepSeek and GLM say n_routed_experts */
-        numExperts         = c["num_experts"].asSize(c["n_routed_experts"].asSize(0));
+        numExperts         = c["num_experts"].asSize(c["num_local_experts"].asSize(c["n_routed_experts"].asSize(0)));
         expertsPerToken    = c["num_experts_per_tok"].asSize(0);
-        moeIntermediate    = c["moe_intermediate_size"].asSize(0);
+        moeIntermediate    = c["moe_intermediate_size"].asSize(spec.modelType == "mixtral" ? intermediate : 0);
         sharedIntermediate = c["shared_expert_intermediate_size"].asSize(0);
-        normTopK           = c["norm_topk_prob"].asBool(true);
+        normTopK           = c["norm_topk_prob"].asBool(spec.modelType != "qwen2_moe");
 
         if (sharedIntermediate == 0)
             sharedIntermediate = moeIntermediate * c["n_shared_experts"].asSize(0);
@@ -773,6 +861,17 @@ struct LocalConfig {
         } else {
             const size_t firstDense = c["first_k_dense_replace"].asSize(0);
             for (size_t i = 0; i < firstDense && i < nLayer; ++i) denseFFN[i] = true;
+        }
+
+        if (spec.modelType == "qwen2_moe") {
+            const size_t step = c["decoder_sparse_step"].asSize(1);
+            if (!step) { error = "decoder_sparse_step must be positive"; return false; }
+            for (size_t i = 0; i < nLayer; ++i) denseFFN[i] = (i + 1) % step != 0;
+            const auto& only = c["mlp_only_layers"];
+            if (only.isArray()) for (size_t i = 0; i < only.size(); ++i) {
+                const size_t layer = only[i].asSize(nLayer);
+                if (layer < nLayer) denseFFN[layer] = true;
+            }
         }
 
         /* GLM nests its linear-attention sizes in an object of their own */
@@ -1130,6 +1229,12 @@ struct LocalTrace {
 // ========================================================================= */
 
 struct LocalCache {
+    // Resident Metal state is private to one conversation. Copies materialize
+    // its KV history on the CPU rather than sharing a mutable GPU cache.
+    std::shared_ptr<void> device;
+    const void* deviceOwner = nullptr;
+    size_t deviceEpoch = 0;
+    bool deviceDisabled = false;
     std::vector<std::vector<float>> keys, values;
 
     /*
@@ -1151,10 +1256,47 @@ struct LocalCache {
     std::vector<std::vector<float>> indexKeys, indexGates, poolKeys;
 
     size_t length = 0, capacity = 0;
+    size_t releasedWidth = 0; // CPU KV storage released while the GPU owns history
+
+    LocalCache() = default;
+    LocalCache(const LocalCache& other) : keys(other.keys), values(other.values),
+        recurrent(other.recurrent), convWindow(other.convWindow), indexKeys(other.indexKeys),
+        indexGates(other.indexGates), poolKeys(other.poolKeys), length(other.length), capacity(other.capacity), releasedWidth(other.releasedWidth) {
+        if (other.device) readDevice(other.device.get());
+    }
+    LocalCache& operator=(const LocalCache& other) {
+        if (this != &other) *this = LocalCache(other);
+        return *this;
+    }
+    LocalCache(LocalCache&&) = default;
+    LocalCache& operator=(LocalCache&&) = default;
+
+    void ensureHost() {
+        if (!releasedWidth) return;
+        for (auto& row : keys) row.resize(capacity * releasedWidth);
+        for (auto& row : values) row.resize(capacity * releasedWidth);
+        releasedWidth = 0;
+    }
+    void releaseHost(size_t width) {
+        for (auto& row : keys) std::vector<float>().swap(row);
+        for (auto& row : values) std::vector<float>().swap(row);
+        releasedWidth = width;
+    }
+    void readDevice(void* source) {
+        ensureHost();
+        std::vector<float*> k, v;
+        for (auto& row : keys) k.push_back(row.data());
+        for (auto& row : values) v.push_back(row.data());
+        aigpu_dense_read_cache(source, k.data(), v.data(), uint32_t(length));
+    }
+    void syncDevice() {
+        if (device) { readDevice(device.get()); device.reset(); }
+    }
 
     void resize(const LocalConfig& cfg, size_t maxSeq) {
+        device.reset(); deviceOwner = nullptr; deviceDisabled = false;
         capacity = maxSeq;
-        length = 0;
+        length = 0; releasedWidth = 0;
 
         keys.assign(cfg.nLayer, {});
         values.assign(cfg.nLayer, {});
@@ -1183,6 +1325,8 @@ struct LocalCache {
     }
 
     void reset() {
+        device.reset();
+        ensureHost(); deviceOwner = nullptr; deviceDisabled = false;
         length = 0;
         for (auto& r : recurrent) std::fill(r.begin(), r.end(), 0.0f);
         for (auto& c : convWindow) std::fill(c.begin(), c.end(), 0.0f);
@@ -1280,7 +1424,24 @@ inline void ropeRow(float* vec, size_t heads, size_t headDim, size_t position,
     LocalModel
 // ========================================================================= */
 
+// Optional wall-clock accounting without retaining activation traces.
+// A model instance, like its forward scratch/cache, is not concurrently mutable.
+struct LocalProfile {
+    enum Stage { Other, Attention, Delta, Latent, MLP, Output, Resident, Count };
+    static const char* name(size_t stage) {
+        static const char* names[]{"embedding/norm/residual", "attention", "recurrent attention",
+            "latent attention/indexer", "feed forward/experts", "output norm/projection", "resident GPU"};
+        return names[stage];
+    }
+    bool enabled = false;
+    std::array<double, Count> seconds{};
+    std::array<size_t, Count> calls{};
+    void reset() { seconds.fill(0); calls.fill(0); }
+};
+
 struct LocalModel {
+    mutable LocalProfile profile;
+    double arrangeSeconds = 0;
     ArchSpec                 spec;
     LocalConfig              cfg;
     quant::Type              quantType = quant::Type::None;
@@ -1524,7 +1685,7 @@ struct LocalModel {
         }
         spec = *found;
 
-        if (!cfg.loadFrom(text, spec)) { error = "config.json: bad or missing fields"; return false; }
+        if (!cfg.loadFrom(text, spec)) { error = "config.json: " + (cfg.error.empty() ? "bad or missing fields" : cfg.error); return false; }
 
         /* decoupled RoPE inside latent attention is the DeepSeek-V3 shape;
            GLM-5.3 has none and that is the only one written */
@@ -1551,6 +1712,7 @@ struct LocalModel {
             error = weights.error;
             return false;
         }
+        const auto arrangeBegin = std::chrono::steady_clock::now();
         /*
             A multimodal checkpoint nests the text tower under
             model.language_model., a text-only one does not. Pick whichever
@@ -1568,6 +1730,7 @@ struct LocalModel {
         try {
             if (!loadTopLevel()) return false;
             if (!loadLayers())   return false;
+            arrangeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - arrangeBegin).count();
         } catch (const std::bad_alloc&) {
             error = "out of memory arranging the weights";
             return false;
@@ -1735,8 +1898,10 @@ struct LocalModel {
         if (!w.valid() || w.outDim == 0) return Tensor<float>();
         if (w.f32.storage) return w.f32.contiguous();
 
-        Tensor<float> out({w.outDim, w.inDim});
-        for (size_t r = 0; r < w.outDim; ++r) widenRow(w, r, out.ptr + r * w.inDim, w.inDim);
+        Tensor<float> out = Tensor<float>::uninitialized({w.outDim, w.inDim});
+        kernels::Pool::instance().run(w.outDim, [&](size_t begin, size_t end) {
+            for (size_t r = begin; r < end; ++r) widenRow(w, r, out.ptr + r * w.inDim, w.inDim);
+        });
         return out;
     }
 
@@ -2178,6 +2343,7 @@ struct LocalModel {
           matrices" is not.
     */
     DeviceReport toDevice(const OffloadPlan& plan = {}, const LoadProgress& onProgress = {}) {
+        ++deviceEpoch;
         DeviceReport report;
         report.layersTotal = layers.size();
 
@@ -2352,6 +2518,7 @@ struct LocalModel {
     /* true once toDevice() has dropped the host weights, after which the
        CPU path is no longer available without reloading */
     bool hostReleased = false;
+    size_t deviceEpoch = 0;
 
     /*
         drops every device buffer and puts the forward pass back on the CPU.
@@ -2359,6 +2526,7 @@ struct LocalModel {
         releaseHost
     */
     void toHost() {
+        ++deviceEpoch;
         forEachMatrix([](Weight& w) {
             w.dev.reset();
             w.devScales.reset();
@@ -2413,11 +2581,9 @@ struct LocalModel {
         const size_t QW = cfg.qWidth();
         const size_t KW = cfg.kvWidth();
         const size_t qStride = spec.attnOutputGate ? D * 2 : D;
-        const size_t total = startPos + count;
 
         std::vector<float> q(count * cfg.nHead * qStride);
         std::vector<float> k(count * KW), v(count * KW), attn(count * QW);
-        std::vector<float> scores(total);
 
         /*
             the reference dumps queries without the gate interleaved into
@@ -2458,12 +2624,22 @@ struct LocalModel {
         /* rotate. With a gate present the query rows are strided, so each
            head is rotated on its own rather than as one contiguous run */
         if (spec.pos == PosKind::RoPE) {
-            const size_t rot = cfg.rotaryDims();
+            const size_t rot = cfg.rotaryDims(), half = rot / 2;
             for (size_t t = 0; t < count; ++t) {
-                for (size_t head = 0; head < cfg.nHead; ++head)
-                    ropeRow(&q[t * cfg.nHead * qStride + head * qStride], 1, D,
-                            startPos + t, cfg.ropeTheta, rot);
-                ropeRow(&k[t * KW], cfg.nKVHead, D, startPos + t, cfg.ropeTheta, rot);
+                for (size_t j = 0; j < half; ++j) {
+                    const float frequency = cfg.rotaryFrequencies.empty()
+                        ? 1.0f / std::pow(cfg.ropeTheta, float(2 * j) / float(rot)) : cfg.rotaryFrequencies[j];
+                    const float angle = float(startPos + t) * frequency;
+                    const float cs = std::cos(angle), sn = std::sin(angle);
+                    const auto rotate = [&](float* x) {
+                        const float a = x[j], b = x[j + half];
+                        x[j] = a * cs - b * sn; x[j + half] = b * cs + a * sn;
+                    };
+                    for (size_t head = 0; head < cfg.nHead; ++head)
+                        rotate(&q[t * cfg.nHead * qStride + head * qStride]);
+                    for (size_t head = 0; head < cfg.nKVHead; ++head)
+                        rotate(&k[t * KW + head * D]);
+                }
             }
             if (trace) {
                 traceQ(tag + "qrope");
@@ -2478,45 +2654,15 @@ struct LocalModel {
                       cache.values[layer].begin() + static_cast<long>((startPos + t) * KW));
         }
 
-        const float invSqrtD = 1.0f / std::sqrt(static_cast<float>(D));
-
-        for (size_t t = 0; t < count; ++t) {
-            const size_t position = startPos + t;
-
+        kernels::attention(q.data(), cache.keys[layer].data(), cache.values[layer].data(),
+            attn.data(), count, startPos, cfg.nHead, cfg.nKVHead, D, qStride,
+            cfg.attentionWindow(layer));
+        if (spec.attnOutputGate) for (size_t t = 0; t < count; ++t)
             for (size_t head = 0; head < cfg.nHead; ++head) {
-                const size_t kvHead = head / cfg.group();
-                const float* qh = &q[t * cfg.nHead * qStride + head * qStride];
-
-                float best = -1e30f;
-                for (size_t j = 0; j <= position; ++j) {
-                    const float sc =
-                        kernels::dot(qh, &cache.keys[layer][j * KW + kvHead * D], D) * invSqrtD;
-                    scores[j] = sc;
-                    best = std::max(best, sc);
-                }
-
-                float sum = 0.0f;
-                for (size_t j = 0; j <= position; ++j) {
-                    scores[j] = std::exp(scores[j] - best);
-                    sum += scores[j];
-                }
-                const float invSum = 1.0f / sum;
-
-                float* o = &attn[t * QW + head * D];
-                for (size_t d = 0; d < D; ++d) o[d] = 0.0f;
-                for (size_t j = 0; j <= position; ++j) {
-                    const float w = scores[j] * invSum;
-                    const float* vh = &cache.values[layer][j * KW + kvHead * D];
-                    for (size_t d = 0; d < D; ++d) o[d] += w * vh[d];
-                }
-
-                // the gate sits in the back half of this head's query row
-                if (spec.attnOutputGate) {
-                    const float* g = qh + D;
-                    for (size_t d = 0; d < D; ++d) o[d] *= sigmoidOf(g[d]);
-                }
+                const float* g = &q[(t * cfg.nHead + head) * qStride + D];
+                float* o = &attn[(t * cfg.nHead + head) * D];
+                for (size_t d = 0; d < D; ++d) o[d] *= sigmoidOf(g[d]);
             }
-        }
 
         apply(attn.data(), L.o, out, count);
         if (trace) trace->add(tag + "attnout", out, count * cfg.hidden);
@@ -2678,31 +2824,8 @@ struct LocalModel {
 
                 float* S = &state[vHead * KD * VD];
 
-                for (size_t i = 0; i < KD * VD; ++i) S[i] *= decay;
-
-                for (size_t d = 0; d < VD; ++d) kv[d] = 0.0f;
-                for (size_t i = 0; i < KD; ++i) {
-                    const float ki = kh[i];
-                    const float* row = S + i * VD;
-                    for (size_t d = 0; d < VD; ++d) kv[d] += row[d] * ki;
-                }
-
-                const float* vh = vRow + vHead * VD;
-                for (size_t d = 0; d < VD; ++d) delta[d] = (vh[d] - kv[d]) * beta;
-
-                for (size_t i = 0; i < KD; ++i) {
-                    const float ki = kh[i];
-                    float* row = S + i * VD;
-                    for (size_t d = 0; d < VD; ++d) row[d] += ki * delta[d];
-                }
-
-                float* o = &core[t * VW + vHead * VD];
-                for (size_t d = 0; d < VD; ++d) o[d] = 0.0f;
-                for (size_t i = 0; i < KD; ++i) {
-                    const float qi = qh[i];
-                    const float* row = S + i * VD;
-                    for (size_t d = 0; d < VD; ++d) o[d] += row[d] * qi;
-                }
+                kernels::deltaStep(S, kh.data(), qh.data(), vRow + vHead * VD,
+                    &decay, false, beta, KD, VD, &core[t * VW + vHead * VD], kv.data(), delta.data());
             }
         }
 
@@ -2802,33 +2925,9 @@ struct LocalModel {
                     l2normalise(kh.data(), D);
                     for (size_t i = 0; i < D; ++i) qh[i] *= qScale;
 
-                    /* row i of the state is key channel i, decayed by its own rate */
                     const float* a = &decay[t * W + head * D];
-                    for (size_t i = 0; i < D; ++i) {
-                        float* r = S + i * D;
-                        for (size_t d = 0; d < D; ++d) r[d] *= a[i];
-                    }
-
-                    std::fill(kv.begin(), kv.end(), 0.0f);
-                    for (size_t i = 0; i < D; ++i) {
-                        const float* r = S + i * D;
-                        for (size_t d = 0; d < D; ++d) kv[d] += r[d] * kh[i];
-                    }
-
-                    const float b = beta[t * nH + head];
-                    for (size_t d = 0; d < D; ++d) delta[d] = (vh[d] - kv[d]) * b;
-
-                    for (size_t i = 0; i < D; ++i) {
-                        float* r = S + i * D;
-                        for (size_t d = 0; d < D; ++d) r[d] += kh[i] * delta[d];
-                    }
-
-                    float* o = &core[t * W + head * D];
-                    std::fill(o, o + D, 0.0f);
-                    for (size_t i = 0; i < D; ++i) {
-                        const float* r = S + i * D;
-                        for (size_t d = 0; d < D; ++d) o[d] += r[d] * qh[i];
-                    }
+                    kernels::deltaStep(S, kh.data(), qh.data(), vh, a, true, beta[t * nH + head],
+                        D, D, &core[t * W + head * D], kv.data(), delta.data());
                 }
             }
         });
@@ -3497,9 +3596,72 @@ struct LocalModel {
     }
 
 
+    bool residentDecode(const float* embedding, LocalCache& cache, size_t position, float* logits) const {
+        if (cache.device && (cache.deviceOwner != this || cache.deviceEpoch != deviceEpoch)) cache.syncDevice();
+        if (cache.device) {
+            aigpu_dense_decode(cache.device.get(), embedding, logits, uint32_t(position));
+            cache.length = position + 1;
+            return true;
+        }
+        if (!lmHead.onDevice() || cache.deviceDisabled || !aigpu_dense_supported() || cfg.streams() != 1 ||
+            cfg.isMoE() || cfg.swigluLimit != 0 || spec.norm != NormKind::RMSNorm ||
+            spec.pos != PosKind::RoPE || spec.mlp != MLPKind::SwiGLU || spec.act != ActKind::SiLU ||
+            spec.normWeightOffset != 0 || spec.attnOutputGate || cfg.headDim % 4 ||
+            !cfg.rotaryDims() || position != cache.length || position >= cache.capacity ||
+            cache.capacity > UINT32_MAX || cfg.hidden > UINT32_MAX || cfg.intermediate > UINT32_MAX ||
+            !lmHead.onDevice() || lmHead.hasBias() || finalNormBias.ptr != nullptr) return false;
+        const auto supported = [](const Weight& w) {
+            return w.onDevice() && w.inDim % 4 == 0 && w.inDim <= UINT32_MAX && w.outDim <= UINT32_MAX;
+        };
+        const auto descriptor = [](const Weight& w) {
+            return AiGpuDenseWeight{w.dev->ptr(), w.devScales ? w.devScales->ptr() : nullptr,
+                uint32_t(w.devType) - 1, uint32_t(w.inDim), uint32_t(w.outDim), w.bias.ptr};
+        };
+        if (!supported(lmHead)) return false;
+        std::vector<AiGpuDenseLayer> description;
+        for (const auto& l : layers) {
+            if (l.mixer != MixerKind::Attention || l.moe || l.inputNormBias.ptr != nullptr || l.postAttnNormBias.ptr != nullptr) return false;
+            for (const Weight* w : {&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down})
+                if (!supported(*w)) return false;
+            description.push_back({descriptor(l.q), descriptor(l.k), descriptor(l.v), descriptor(l.o),
+                descriptor(l.gate), descriptor(l.up), descriptor(l.down), l.inputNorm.ptr, l.postAttnNorm.ptr,
+                spec.qkNorm ? l.qNorm.ptr : nullptr, spec.qkNorm ? l.kNorm.ptr : nullptr,
+                uint32_t(cfg.attentionWindow(description.size()))});
+        }
+        std::vector<const float*> keys, values;
+        for (const auto& row : cache.keys) keys.push_back(row.data());
+        for (const auto& row : cache.values) values.push_back(row.data());
+        const AiGpuDenseConfig config{uint32_t(cfg.hidden), uint32_t(cfg.nLayer), uint32_t(cfg.nHead),
+            uint32_t(cfg.nKVHead), uint32_t(cfg.headDim), uint32_t(cfg.intermediate), uint32_t(cache.capacity),
+            uint32_t(cfg.rotaryDims()), uint32_t(cfg.vocab), cfg.normEps, cfg.ropeTheta, finalNorm.ptr, descriptor(lmHead),
+            cfg.rotaryFrequencies.empty() ? nullptr : cfg.rotaryFrequencies.data()};
+        void* context = aigpu_dense_create(&config, description.data(), keys.data(), values.data(), uint32_t(position));
+        if (!context) { cache.deviceDisabled = true; return false; }
+        cache.device = std::shared_ptr<void>(context, aigpu_dense_release);
+        cache.deviceOwner = this; cache.deviceEpoch = deviceEpoch;
+        cache.releaseHost(cfg.kvWidth());
+        aigpu_dense_decode(context, embedding, logits, uint32_t(position));
+        cache.length = position + 1;
+        return true;
+    }
+
     void forward(const size_t* ids, size_t count, size_t startPos,
                  LocalCache& cache, float* logitsOut, LocalTrace* trace = nullptr) const {
+        using ProfileClock = std::chrono::steady_clock;
+        auto stamp = profile.enabled ? ProfileClock::now() : ProfileClock::time_point{};
+        const auto mark = [&](LocalProfile::Stage stage) {
+            if (!profile.enabled) return;
+            const auto now = ProfileClock::now();
+            profile.seconds[stage] += std::chrono::duration<double>(now - stamp).count();
+            ++profile.calls[stage]; stamp = now;
+        };
         const size_t H = cfg.hidden;
+        if (count == 1 && !trace && lmHead.onDevice()) {
+            std::vector<float> embedding(H);
+            widenRow(embed, ids[0], embedding.data(), H);
+            if (residentDecode(embedding.data(), cache, startPos, logitsOut)) { mark(LocalProfile::Resident); return; }
+        }
+        cache.syncDevice();
 
         /*
             With hyper-connections the residual is S streams per token rather
@@ -3557,6 +3719,7 @@ struct LocalModel {
             /* the only place the layer kinds differ: everything either side
                of this - the norms, the residual, the feed forward - is
                identical whichever mixer sits in the middle */
+            mark(LocalProfile::Other);
             switch (L.mixer) {
                 case MixerKind::GatedDeltaNet:
                     gatedDeltaNetMixer(h.data(), L, l, count, cache, proj.data(), tag, trace);
@@ -3574,6 +3737,9 @@ struct LocalModel {
                     break;
             }
 
+            mark(L.mixer == MixerKind::LatentAttention ? LocalProfile::Latent
+                : L.mixer == MixerKind::KimiDelta || L.mixer == MixerKind::GatedDeltaNet ? LocalProfile::Delta
+                : LocalProfile::Attention);
             if (S > 1) hcExpand(x.data(), proj.data(), post.data(), comb.data(), count);
             else       for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
             if (trace) trace->add(tag + "res1", x.data(), count * S * H);
@@ -3588,6 +3754,7 @@ struct LocalModel {
                 normRow(&in[t * H], L.postAttnNorm, L.postAttnNormBias, &h[t * H], H);
             if (trace) trace->add(tag + "ln2", h.data(), count * H);
 
+            mark(LocalProfile::Other);
             if (L.moe) {
                 moeBlock(h.data(), L, count, proj.data(), tag, trace);
             } else {
@@ -3608,6 +3775,7 @@ struct LocalModel {
                 if (trace) trace->add(tag + "mlpout", proj.data(), count * H);
             }
 
+            mark(LocalProfile::MLP);
             if (S > 1) hcExpand(x.data(), proj.data(), post.data(), comb.data(), count);
             else       for (size_t i = 0; i < count * H; ++i) x[i] += proj[i];
             if (trace) trace->add(tag + "res2", x.data(), count * S * H);
@@ -3616,6 +3784,7 @@ struct LocalModel {
         cache.length = startPos + count;
 
         /* the streams end as their plain mean, then the usual final norm */
+        mark(LocalProfile::Other);
         std::vector<float> lastIn(H, 0.0f), last(H);
         const float* lastRow = &x[(count - 1) * S * H];
         for (size_t n = 0; n < S; ++n)
@@ -3628,6 +3797,7 @@ struct LocalModel {
         head.outDim = cfg.vocab;
         head.inDim  = H;
         apply(last.data(), head, logitsOut, 1);
+        mark(LocalProfile::Output);
         if (trace) trace->add("logits", logitsOut, cfg.vocab);
     }
 

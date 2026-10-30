@@ -117,6 +117,40 @@ AI_GPU_ABI void aigpu_synchronize(void);
 AI_GPU_ABI void aigpu_counters(AiGpuCounters* out);
 AI_GPU_ABI void aigpu_reset_counters(void);
 
+/* Optional resident single-token decoder. Non-Metal backends return 0
+   from supported() and retain the existing per-matmul execution path. */
+typedef struct AiGpuDenseWeight {
+    const void* codes;
+    const void* scales;
+    uint32_t type, inDim, outDim; /* F32=0, BF16=1, Q8=2, Q4=3 */
+    const float* bias; /* optional, copied at creation */
+} AiGpuDenseWeight;
+typedef struct AiGpuDenseLayer {
+    AiGpuDenseWeight q, k, v, o, gate, up, down;
+    const float* inputNorm;
+    const float* postNorm;
+    const float* qNorm;
+    const float* kNorm;
+    uint32_t window; /* 0 = full causal attention */
+} AiGpuDenseLayer;
+typedef struct AiGpuDenseConfig {
+    uint32_t hidden, layers, heads, kvHeads, headDim, intermediate;
+    uint32_t capacity, rotaryDims, vocab;
+    float epsilon, theta;
+    const float* finalNorm;
+    AiGpuDenseWeight head;
+    const float* rotaryFrequencies; /* rotaryDims/2 entries; optional */
+} AiGpuDenseConfig;
+AI_GPU_ABI int aigpu_dense_supported(void);
+AI_GPU_ABI void* aigpu_dense_create(const AiGpuDenseConfig* config,
+    const AiGpuDenseLayer* layers, const float* const* keys,
+    const float* const* values, uint32_t length);
+AI_GPU_ABI void aigpu_dense_release(void* context);
+AI_GPU_ABI void aigpu_dense_decode(void* context, const float* embedding,
+    float* logits, uint32_t position);
+AI_GPU_ABI void aigpu_dense_read_cache(void* context, float* const* keys,
+    float* const* values, uint32_t length);
+
 #ifdef __cplusplus
 } // !extern "C"
 #endif
